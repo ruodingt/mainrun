@@ -2,6 +2,8 @@
 import math, random, time
 import os
 from dataclasses import dataclass
+from typing import Any
+
 import expt_util
 from rope import apply_rotary_emb, RotaryEmbedding
 from optim import MuonAdamW
@@ -26,11 +28,13 @@ class Hyperparameters:
     muon_lr: float = 0.02      # Muon: 2D weight matrices (attn, mlp)
     adamw_lr: float = 3e-4     # AdamW: embeddings, norms, biases
     adamw_wd: float = 0.1      # weight decay for AdamW group only
+    warmup_frac: float = 0.05  # fraction of total steps for linear warmup
+    min_lr_frac: float = 0.1   # cosine decay floor as fraction of peak lr
     evals_per_epoch: int = 3
 
     use_fa2: bool = True
     use_bf16: bool = True
-    n_kv_heads: int = 8 # n_kv_heads can be 1, 2, 4 to enable MQA
+    n_kv_heads: int = 1 # n_kv_heads can be 1, 2, 4 to enable MQA
     
     epochs: int = 7
     seed: int = 1337
@@ -45,10 +49,18 @@ class Hyperparameters:
 
 
 
+import contextlib
+
+def make_autocast(device: str, dtype: torch.dtype | None):
+    if dtype is not None:
+        return torch.amp.autocast(device_type=device, dtype=dtype)
+    return contextlib.nullcontext()
+
+
 logger = None
 tb_writer = None
 
-def get_titles(num_titles: int, seed: int, val_frac: float) -> str:
+def get_titles(num_titles: int, seed: int, val_frac: float) -> tuple[list[Any], list[Any]]:
     ds = load_dataset("julien040/hacker-news-posts", split="train", cache_dir="./data").shuffle(seed=seed)
     titles = [row["title"].strip() for row in ds.take(num_titles)]
     n = int(num_titles * (1 - val_frac))
@@ -242,7 +254,8 @@ class GPT(nn.Module):
         cos_sin = self.rope(x, T)
         for block in self.blocks: x = block(x, cos_sin)
         x = self.ln_f(x)
-        logits = self.head(x)
+        # Cast to fp32 for numerically stable cross-entropy (safe under autocast too).
+        logits = self.head(x).float()
         if targets is None:
             loss = None
         else:
@@ -272,7 +285,7 @@ def main():
     train_titles, val_titles = get_titles(args.num_titles, args.seed, args.val_frac)
     
     eos_token = "<eos>"
-    tok = BPETokenizer(train_tokenizer(train_titles+val_titles, args.vocab_size, eos_token=eos_token))
+    tok = BPETokenizer(train_tokenizer(train_titles + val_titles, args.vocab_size, eos_token=eos_token))
     train_text = eos_token.join(train_titles) + eos_token
     val_text = eos_token.join(val_titles) + eos_token
     train_ids = torch.tensor(tok.encode(train_text), dtype=torch.long)
@@ -291,21 +304,29 @@ def main():
     print("vocab:", tok.vocab_size)
     # exit()
     cfg = GPTConfig(
-        vocab_size = tok.vocab_size,
-        block_size = args.block_size,
-        n_layer    = args.n_layer,
-        n_q_head   = args.n_q_head,
-        d_model    = args.d_model,
-        dropout    = args.dropout,
-        use_fa2    = args.use_fa2
+        vocab_size  = tok.vocab_size,
+        block_size  = args.block_size,
+        n_layer     = args.n_layer,
+        n_q_head    = args.n_q_head,
+        n_kv_heads  = args.n_kv_heads,
+        d_model     = args.d_model,
+        dropout     = args.dropout,
+        use_fa2     = args.use_fa2,
     )
     model = GPT(cfg).to(device)
     model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.log("model_info", parameters_count=model_params)
-    
+
     # Save a comprehensive model summary to the experiment and run directories
     expt_util.save_model_summary(model, exp_dir, run_dir)
-    
+
+    # Mixed precision: autocast handles bf16 matmuls automatically (weight storage stays fp32,
+    # actual matmuls run in bf16). Optimizer states remain fp32 (handled in optim.py).
+    # This is the industrial standard — autocast is smarter than manual casting because it
+    # only downcasts ops that are safe in reduced precision (matmul, conv), and leaves
+    # accumulations and softmax in fp32.
+    amp_dtype = torch.bfloat16 if args.use_bf16 else None  # None = no autocast
+
     # MuonAdamW: Muon for 2D weight matrices, AdamW for embeddings/norms/biases.
     # Muon should not be used for embedding or head layers (see optim.py docstring).
     # head.weight is tied to token_emb.weight, so excluding one excludes both.
@@ -320,6 +341,7 @@ def main():
         else:
             muon_groups.setdefault(tuple(p.shape), []).append(p)
 
+    compute_dtype = torch.bfloat16 if args.use_bf16 else torch.float32
     param_groups = [
         *[{'kind': 'muon', 'params': ps, 'lr': args.muon_lr,
            'momentum': 0.95, 'ns_steps': 5, 'beta2': 0.999, 'weight_decay': 0.0}
@@ -327,15 +349,22 @@ def main():
         {'kind': 'adamw', 'params': adamw_params, 'lr': args.adamw_lr,
          'betas': (0.9, 0.95), 'eps': 1e-8, 'weight_decay': args.adamw_wd},
     ]
-    compute_dtype = torch.bfloat16 if args.use_bf16 else torch.float32
     opt = MuonAdamW(param_groups, compute_dtype=compute_dtype)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_steps)
+
+    # Linear warmup then cosine decay to min_lr_frac * peak_lr.
+    warmup_steps = int(max_steps * args.warmup_frac)
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(warmup_steps, 1)
+        progress = (step - warmup_steps) / max(max_steps - warmup_steps, 1)
+        return args.min_lr_frac + (1 - args.min_lr_frac) * 0.5 * (1 + math.cos(math.pi * progress))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
 
     def evaluate():
         model.eval()
         losses = 0.0
         with torch.no_grad():
-            for xb, yb in iter_full_split(val_ids, args.block_size, args.batch_size, device):
+            for xb, yb in iter_full_split(val_ids, args.block_size, args.batch_size, torch.device(device)):
                 logits, _ = model(xb, yb)
                 B, T, V = logits.size()
                 loss = F.cross_entropy(logits.view(-1, V), yb.view(-1), reduction='sum')
@@ -353,7 +382,8 @@ def main():
             step_start = time.time()
             step += 1
             xb, yb, ptr = get_batch(train_ids, ptr, args.block_size, args.batch_size, device)
-            _, loss = model(xb, yb)
+            with make_autocast(device, amp_dtype):
+                _, loss = model(xb, yb)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -405,12 +435,26 @@ def main():
                 if tb_writer:
                     tb_writer.add_scalar("Loss/val", val_loss, step)
 
-    # Record final hyperparameters and metric
+    # Record final hyperparameters and metrics.
+    # In TensorBoard's HParams tab this becomes an interactive scatter-plot matrix:
+    # pick any two axes (hparam or metric) and each run plots as a single point.
+    # total_time_min + param_count let you see the loss/speed/size trade-off across runs.
+    #
+    # We write directly into the existing FileWriter instead of calling add_hparams(),
+    # because add_hparams() creates an ugly timestamped subdirectory (known TB bug).
     if tb_writer:
-        tb_writer.add_hparams(
-            hparam_dict=args.get_fingerprint(ignore=['log_file']),
-            metric_dict={"Loss/val_final": val_loss}
-        )
+        from torch.utils.tensorboard.summary import hparams as tb_hparams
+        total_time_min = (time.time() - t0) / 60
+        hparam_dict = args.get_fingerprint(ignore=['log_file'])
+        metric_dict = {
+            "Loss/val_final":      val_loss,
+            "Perf/total_time_min": total_time_min,
+            "Model/param_count":   float(model_params),
+        }
+        exp, ssi, sei = tb_hparams(hparam_dict, metric_dict)
+        tb_writer.file_writer.add_summary(exp)
+        tb_writer.file_writer.add_summary(ssi)
+        tb_writer.file_writer.add_summary(sei)
 
 if __name__ == "__main__":
     os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"

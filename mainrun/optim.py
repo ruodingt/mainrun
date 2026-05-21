@@ -215,11 +215,12 @@ class MuonAdamW(torch.optim.Optimizer):
             grad = p.grad
             state = self.state[p]
 
-            # State init
+            # State init — always fp32 regardless of param dtype.
+            # bf16/fp16 second moments lose too much precision and destabilize Adam.
             if not state:
                 state['step'] = 0
-                state['exp_avg'] = torch.zeros_like(p)
-                state['exp_avg_sq'] = torch.zeros_like(p)
+                state['exp_avg']    = torch.zeros_like(p, dtype=torch.float32)
+                state['exp_avg_sq'] = torch.zeros_like(p, dtype=torch.float32)
             exp_avg = state['exp_avg']
             exp_avg_sq = state['exp_avg_sq']
             state['step'] += 1
