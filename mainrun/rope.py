@@ -125,15 +125,14 @@ def _apply_rope_native(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) ->
 # ==========================================
 def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """
-    Unified routing entry point for RoPE.
-    Dynamically detects runtime hardware status and routes execution to the optimal backend.
+    Apply RoPE. Always uses the native differentiable path.
+
+    The Triton kernel above is forward-only (no autograd backward), so it would sever
+    the computation graph during training. A proper fix would wrap it in
+    torch.autograd.Function with backward = apply RoPE with -sin. Not done here since
+    this project only runs training, not inference.
     """
-    if x.is_cuda and HAS_TRITON:
-        # GPU Scenario: Run high-performance Triton fused-kernel path
-        return _apply_rope_gpu_triton(x, cos, sin)
-    else:
-        # CPU/Fallback Scenario: Run memory-friendly native path compatible with compiler fusion
-        return _apply_rope_native(x, cos, sin)
+    return _apply_rope_native(x, cos, sin)
 
 
 # ==========================================

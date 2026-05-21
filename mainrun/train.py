@@ -1,8 +1,10 @@
 # import utils
 import math, random, time
+import os
 from dataclasses import dataclass
 import expt_util
 from rope import apply_rotary_emb, RotaryEmbedding
+from optim import MuonAdamW
 
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -21,8 +23,9 @@ class Hyperparameters:
     n_q_head: int = 8 # number of query head
     d_model: int = 512
     dropout: float = 0.1
-    lr: float = 6e-3
-    weight_decay: float = 0.0
+    muon_lr: float = 0.02      # Muon: 2D weight matrices (attn, mlp)
+    adamw_lr: float = 3e-4     # AdamW: embeddings, norms, biases
+    adamw_wd: float = 0.1      # weight decay for AdamW group only
     evals_per_epoch: int = 3
 
     use_fa2: bool = True
@@ -286,7 +289,7 @@ def main():
                vocab_size=tok.vocab_size)
 
     print("vocab:", tok.vocab_size)
-    exit()
+    # exit()
     cfg = GPTConfig(
         vocab_size = tok.vocab_size,
         block_size = args.block_size,
@@ -303,7 +306,29 @@ def main():
     # Save a comprehensive model summary to the experiment and run directories
     expt_util.save_model_summary(model, exp_dir, run_dir)
     
-    opt = torch.optim.SGD(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # MuonAdamW: Muon for 2D weight matrices, AdamW for embeddings/norms/biases.
+    # Muon should not be used for embedding or head layers (see optim.py docstring).
+    # head.weight is tied to token_emb.weight, so excluding one excludes both.
+    skip_ids = {id(model.token_emb.weight), id(model.head.weight)}
+    muon_groups: dict[tuple, list] = {}
+    adamw_params: list = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if id(p) in skip_ids or p.ndim < 2:
+            adamw_params.append(p)
+        else:
+            muon_groups.setdefault(tuple(p.shape), []).append(p)
+
+    param_groups = [
+        *[{'kind': 'muon', 'params': ps, 'lr': args.muon_lr,
+           'momentum': 0.95, 'ns_steps': 5, 'beta2': 0.999, 'weight_decay': 0.0}
+          for ps in muon_groups.values()],
+        {'kind': 'adamw', 'params': adamw_params, 'lr': args.adamw_lr,
+         'betas': (0.9, 0.95), 'eps': 1e-8, 'weight_decay': args.adamw_wd},
+    ]
+    compute_dtype = torch.bfloat16 if args.use_bf16 else torch.float32
+    opt = MuonAdamW(param_groups, compute_dtype=compute_dtype)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_steps)
 
     def evaluate():
@@ -361,7 +386,8 @@ def main():
 
             if tb_writer:
                 tb_writer.add_scalar("Loss/train", loss.item(), step)
-                tb_writer.add_scalar("Charts/learning_rate", opt.param_groups[0]['lr'], step)
+                tb_writer.add_scalar("Charts/muon_lr", opt.param_groups[0]['lr'], step)
+                tb_writer.add_scalar("Charts/adamw_lr", opt.param_groups[-1]['lr'], step)
                 tb_writer.add_scalar("Throughput/local_tokens_per_sec", local_tokens_per_sec, step)
                 tb_writer.add_scalar("Throughput/avg_tokens_per_sec", avg_tokens_per_sec, step)
                 tb_writer.add_scalar("Memory/allocated_GB", allocated_gb, step)
@@ -387,6 +413,7 @@ def main():
         )
 
 if __name__ == "__main__":
+    os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
     try:
         main()
     finally:
