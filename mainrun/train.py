@@ -3,8 +3,11 @@ import math, random, time
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import yaml
+import expt_util
 
 import torch
+from torch.utils.tensorboard import SummaryWriter
 import torch.nn as nn
 from torch.nn import functional as F
 from datasets import load_dataset
@@ -30,6 +33,11 @@ class Hyperparameters:
     num_titles: int = 100_000
     val_frac: float = 0.10
     log_file: str = "./logs/mainrun.log"
+
+    def get_fingerprint(self, ignore: list[str] | None = None) -> dict:
+        if ignore is None:
+            ignore = ['seed']
+        return {k: v for k, v in vars(self).items() if k not in ignore}
 
 def configure_logging(log_file: str):
     Path(log_file).parent.mkdir(parents=True, exist_ok=True)
@@ -76,6 +84,7 @@ def configure_logging(log_file: str):
     return DualLogger(file_handler)
 
 logger = None
+tb_writer = None
 
 def get_titles(num_titles: int, seed: int, val_frac: float) -> str:
     ds = load_dataset("julien040/hacker-news-posts", split="train", cache_dir="./data").shuffle(seed=seed)
@@ -222,8 +231,14 @@ def main():
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     
-    global logger
+    # Resolve experiment and run directories
+    exp_dir = expt_util.get_or_create_experiment_dir(args)
+    run_dir = expt_util.create_run_dir(exp_dir, args.seed)
+    args.log_file = str(run_dir / "log.txt")
+    
+    global logger, tb_writer
     logger = configure_logging(args.log_file)
+    tb_writer = SummaryWriter(log_dir=str(run_dir))
     
     hyperparams_dict = vars(args)
     logger.log("hyperparameters_configured", **hyperparams_dict)
@@ -262,6 +277,9 @@ def main():
     model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.log("model_info", parameters_count=model_params)
     
+    # Save a comprehensive model summary to the experiment and run directories
+    expt_util.save_model_summary(model, exp_dir, run_dir)
+    
     opt = torch.optim.SGD(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_steps)
 
@@ -279,9 +297,12 @@ def main():
 
     ptr = 0
     step = 0
+    val_loss = 0.0
     t0 = time.time()
+    tokens_per_step = args.block_size * args.batch_size
     for epoch in range(1, args.epochs + 1):
         for _ in tqdm(range(1, batches + 1), desc=f"Epoch {epoch}/{args.epochs}"):
+            step_start = time.time()
             step += 1
             xb, yb, ptr = get_batch(train_ids, ptr, args.block_size, args.batch_size, device)
             _, loss = model(xb, yb)
@@ -291,13 +312,38 @@ def main():
             opt.step()
             scheduler.step()
 
-            elapsed = time.time() - t0
+            t1 = time.time()
+            step_time = t1 - step_start
+            elapsed = t1 - t0
+            
+            # Calculate performance metrics
+            local_tokens_per_sec = tokens_per_step / step_time if step_time > 0 else 0.0
+            avg_tokens_per_sec = (step * tokens_per_step) / elapsed if elapsed > 0 else 0.0
+            
+            if torch.cuda.is_available():
+                allocated_gb = torch.cuda.memory_allocated() / 1e9
+                reserved_gb = torch.cuda.memory_reserved() / 1e9
+                max_allocated_gb = torch.cuda.max_memory_allocated() / 1e9
+            else:
+                allocated_gb = 0.0
+                reserved_gb = 0.0
+                max_allocated_gb = 0.0
+
             logger.log("training_step",
                       step=step,
                       max_steps=max_steps,
                       loss=loss.item(),
                       elapsed_time=elapsed,
                       prnt=False)
+
+            if tb_writer:
+                tb_writer.add_scalar("Loss/train", loss.item(), step)
+                tb_writer.add_scalar("Charts/learning_rate", opt.param_groups[0]['lr'], step)
+                tb_writer.add_scalar("Throughput/local_tokens_per_sec", local_tokens_per_sec, step)
+                tb_writer.add_scalar("Throughput/avg_tokens_per_sec", avg_tokens_per_sec, step)
+                tb_writer.add_scalar("Memory/allocated_GB", allocated_gb, step)
+                tb_writer.add_scalar("Memory/reserved_GB", reserved_gb, step)
+                tb_writer.add_scalar("Memory/max_allocated_GB", max_allocated_gb, step)
 
             if step == 1 or step % eval_interval == 0 or step == max_steps:
                 val_loss = evaluate()
@@ -306,6 +352,16 @@ def main():
                           max_steps=max_steps,
                           loss=val_loss,
                           elapsed_time=elapsed)
+                
+                if tb_writer:
+                    tb_writer.add_scalar("Loss/val", val_loss, step)
+
+    # Record final hyperparameters and metric
+    if tb_writer:
+        tb_writer.add_hparams(
+            hparam_dict=args.get_fingerprint(ignore=['log_file']),
+            metric_dict={"Loss/val_final": val_loss}
+        )
 
 if __name__ == "__main__":
     try:
@@ -313,3 +369,5 @@ if __name__ == "__main__":
     finally:
         if logger and hasattr(logger, 'file_handler'):
             logger.file_handler.close()
+        if tb_writer:
+            tb_writer.close()
