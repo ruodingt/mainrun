@@ -2,6 +2,7 @@
 import math, random, time
 from dataclasses import dataclass
 import expt_util
+from rope import apply_rotary_emb, RotaryEmbedding
 
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -141,7 +142,7 @@ class CausalSelfAttention(nn.Module):
             tril = torch.tril(torch.ones(cfg.block_size, cfg.block_size, dtype=torch.bool))
             self.register_buffer("tril", tril, persistent=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cos_sin) -> torch.Tensor:
         B, T, C = x.size()
 
         # 1. Project Q and KV
@@ -151,6 +152,9 @@ class CausalSelfAttention(nn.Module):
         # kv shape: (B, T, 2, n_kv_heads, head_dim) -> transpose to (B, n_kv_heads, T, head_dim)
         kv = self.kv_proj(x).view(B, T, 2, self.n_kv_heads, self.head_dim).transpose(1, 3)
         k, v = kv[..., 0, :, :], kv[..., 1, :, :]
+
+        cos, sin = cos_sin
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
 
         # 2. Static conditional routing
         if self.use_sdpa:
@@ -199,8 +203,8 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(cfg.d_model)
         self.attn = CausalSelfAttention(cfg)
         self.mlp  = MLP(cfg)
-    def forward(self, x):
-        x = x + self.attn(self.ln1(x))
+    def forward(self, x, cos_sin):
+        x = x + self.attn(self.ln1(x), cos_sin)
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -209,8 +213,10 @@ class GPT(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.token_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.pos_emb   = nn.Parameter(torch.zeros(1, cfg.block_size, cfg.d_model))
         self.drop      = nn.Dropout(cfg.dropout)
+
+        head_dim = cfg.d_model // cfg.n_q_head
+        self.rope = RotaryEmbedding(head_dim, max_seq_len=cfg.block_size)
         self.blocks    = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
         self.ln_f      = nn.LayerNorm(cfg.d_model)
         self.head      = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
@@ -229,10 +235,9 @@ class GPT(nn.Module):
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         B, T = idx.size()
-        tok = self.token_emb(idx)
-        pos = self.pos_emb[:, :T, :]
-        x = self.drop(tok + pos)
-        for block in self.blocks: x = block(x)
+        x = self.drop(self.token_emb(idx))
+        cos_sin = self.rope(x, T)
+        for block in self.blocks: x = block(x, cos_sin)
         x = self.ln_f(x)
         logits = self.head(x)
         if targets is None:
