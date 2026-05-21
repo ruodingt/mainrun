@@ -1,4 +1,8 @@
-from tokenizer import train_tokenizer, BPETokenizer, apply_cap_tags
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from mainrun.tokenizer import train_tokenizer, BPETokenizer, apply_cap_tags
 
 if __name__ == "__main__":
     import time
@@ -6,7 +10,8 @@ if __name__ == "__main__":
     from datasets import load_dataset
     from pathlib import Path
 
-    _PATH = Path(__file__).parent.parent / "experiments"
+    _PATH_ROOT = Path(__file__).parent.parent
+    _PATH = _PATH_ROOT / ".generated"
 
     # Vocab size candidates are multiples of 64.
     # WMMA (Wave Matrix Multiply Accumulate) on AMD RDNA 3.5 requires matrix
@@ -18,7 +23,7 @@ if __name__ == "__main__":
 
     t0 = time.time()
     print("Loading data...", flush=True)
-    ds = load_dataset("julien040/hacker-news-posts", split="train", cache_dir="./data").shuffle(seed=1337)
+    ds = load_dataset("julien040/hacker-news-posts", split="train", cache_dir=_PATH_ROOT / "mainrun/data").shuffle(seed=1337)
     titles = [row["title"].strip() for row in ds.take(100_000)]
     n_train = int(100_000 * 0.9)
     train_titles, val_titles = titles[:n_train], titles[n_train:]
