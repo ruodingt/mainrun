@@ -1,5 +1,11 @@
-import yaml
+import json
+import time
 from pathlib import Path
+
+import structlog
+import yaml
+from tqdm import tqdm
+
 
 def get_or_create_experiment_dir(args, base_dir: str = "./experiments") -> Path:
     """
@@ -8,19 +14,19 @@ def get_or_create_experiment_dir(args, base_dir: str = "./experiments") -> Path:
     """
     base_path = Path(base_dir)
     base_path.mkdir(parents=True, exist_ok=True)
-    
+
     fingerprint = args.get_fingerprint(ignore=['seed', 'log_file'])
-    
+
     # Scan existing expXXX directories
     existing_exps = []
     if base_path.exists():
         for p in base_path.iterdir():
             if p.is_dir() and p.name.startswith("exp") and p.name[3:].isdigit():
                 existing_exps.append(p)
-                
+
     # Sort them by their numeric ID
     existing_exps.sort(key=lambda x: int(x.name[3:]))
-    
+
     # Check if any experiment matches the current fingerprint
     for exp_path in existing_exps:
         hp_path = exp_path / "hp.yaml"
@@ -32,23 +38,24 @@ def get_or_create_experiment_dir(args, base_dir: str = "./experiments") -> Path:
                     return exp_path
             except Exception:
                 pass
-                
+
     # If no match, create a new expXXX directory
     if existing_exps:
         next_num = int(existing_exps[-1].name[3:]) + 1
     else:
         next_num = 0
-        
+
     new_exp_name = f"exp{next_num:03d}"
     new_exp_path = base_path / new_exp_name
     new_exp_path.mkdir(parents=True, exist_ok=True)
-    
+
     # Write hp.yaml
     hp_path = new_exp_path / "hp.yaml"
     with open(hp_path, 'w') as f:
         yaml.safe_dump(fingerprint, f, default_flow_style=False)
-        
+
     return new_exp_path
+
 
 def create_run_dir(exp_dir: Path, seed: int) -> Path:
     """
@@ -60,26 +67,27 @@ def create_run_dir(exp_dir: Path, seed: int) -> Path:
     for p in exp_dir.iterdir():
         if p.is_dir() and p.name.startswith("run") and p.name[3:].isdigit():
             existing_runs.append(p)
-            
+
     # Sort them by their numeric ID
     existing_runs.sort(key=lambda x: int(x.name[3:]))
-    
+
     # Get next run number
     if existing_runs:
         next_num = int(existing_runs[-1].name[3:]) + 1
     else:
         next_num = 1
-        
+
     new_run_name = f"run{next_num:02d}"
     new_run_path = exp_dir / new_run_name
     new_run_path.mkdir(parents=True, exist_ok=True)
-    
+
     # Write run.yaml
     run_yaml_path = new_run_path / "run.yaml"
     with open(run_yaml_path, 'w') as f:
         yaml.safe_dump({"seed": seed}, f, default_flow_style=False)
-        
+
     return new_run_path
+
 
 def save_model_summary(model, exp_dir: Path, run_dir: Path):
     """
@@ -89,7 +97,7 @@ def save_model_summary(model, exp_dir: Path, run_dir: Path):
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     non_trainable_params = total_params - trainable_params
-    
+
     summary_content = (
         "=========================================\n"
         "Model Architecture\n"
@@ -102,13 +110,59 @@ def save_model_summary(model, exp_dir: Path, run_dir: Path):
         f"Trainable Parameters: {trainable_params:,}\n"
         f"Non-trainable Parameters: {non_trainable_params:,}\n"
     )
-    
+
     # Write to expXXX/model_summary.txt
     exp_summary_path = exp_dir / "model_summary.txt"
     with open(exp_summary_path, 'w') as f:
         f.write(summary_content)
-        
+
     # Write to runYY/model_summary.txt
     run_summary_path = run_dir / "model_summary.txt"
     with open(run_summary_path, 'w') as f:
         f.write(summary_content)
+
+
+def configure_logging(log_file: str):
+    Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+
+    file_handler = open(log_file, 'w')
+
+    structlog.configure(
+        processors=[
+            structlog.stdlib.filter_by_level,
+            structlog.stdlib.add_logger_name,
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.PositionalArgumentsFormatter(),
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.format_exc_info,
+            structlog.processors.UnicodeDecoder(),
+            structlog.processors.JSONRenderer()
+        ],
+        context_class=dict,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        cache_logger_on_first_use=True,
+    )
+
+    class DualLogger:
+        def __init__(self, file_handler):
+            self.file_handler = file_handler
+            self.logger = structlog.get_logger()
+
+        def log(self, event, **kwargs):
+            log_entry = json.dumps({"event": event, "timestamp": time.time(), **kwargs})
+            self.file_handler.write(log_entry + "\n")
+            self.file_handler.flush()
+
+            if kwargs.get("prnt", True):
+                if "step" in kwargs and "max_steps" in kwargs:
+                    tqdm.write(
+                        f"[{kwargs.get('step'):>5}/{kwargs.get('max_steps')}] {event}: loss={kwargs.get('loss', 'N/A'):.6f} time={kwargs.get('elapsed_time', 0):.2f}s")
+                else:
+                    parts = [f"{k}={v}" for k, v in kwargs.items() if k not in ["prnt", "timestamp"]]
+                    if parts:
+                        tqdm.write(f"{event}: {', '.join(parts)}")
+                    else:
+                        tqdm.write(event)
+
+    return DualLogger(file_handler)

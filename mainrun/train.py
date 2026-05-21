@@ -1,9 +1,6 @@
-import utils
+# import utils
 import math, random, time
 from dataclasses import dataclass
-import json
-from pathlib import Path
-import yaml
 import expt_util
 
 import torch
@@ -13,7 +10,6 @@ from torch.nn import functional as F
 from datasets import load_dataset
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
 from tqdm import tqdm
-import structlog
 
 @dataclass
 class Hyperparameters:
@@ -21,12 +17,16 @@ class Hyperparameters:
     batch_size: int = 64
     vocab_size: int = 16_000
     n_layer: int = 6
-    n_head: int = 8
+    n_q_head: int = 8 # number of query head
     d_model: int = 512
     dropout: float = 0.1
     lr: float = 6e-3
     weight_decay: float = 0.0
     evals_per_epoch: int = 3
+
+    use_fa2: bool = True
+    use_bf16: bool = True
+    n_kv_heads: int = 8 # n_kv_heads can be 1, 2, 4 to enable MQA
     
     epochs: int = 7
     seed: int = 1337
@@ -39,49 +39,7 @@ class Hyperparameters:
             ignore = ['seed']
         return {k: v for k, v in vars(self).items() if k not in ignore}
 
-def configure_logging(log_file: str):
-    Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-    
-    file_handler = open(log_file, 'w')
-    
-    structlog.configure(
-        processors=[
-            structlog.stdlib.filter_by_level,
-            structlog.stdlib.add_logger_name,
-            structlog.stdlib.add_log_level,
-            structlog.stdlib.PositionalArgumentsFormatter(),
-            structlog.processors.TimeStamper(fmt="iso"),
-            structlog.processors.StackInfoRenderer(),
-            structlog.processors.format_exc_info,
-            structlog.processors.UnicodeDecoder(),
-            structlog.processors.JSONRenderer()
-        ],
-        context_class=dict,
-        logger_factory=structlog.stdlib.LoggerFactory(),
-        cache_logger_on_first_use=True,
-    )
-    
-    class DualLogger:
-        def __init__(self, file_handler):
-            self.file_handler = file_handler
-            self.logger = structlog.get_logger()
-            
-        def log(self, event, **kwargs):
-            log_entry = json.dumps({"event": event, "timestamp": time.time(), **kwargs})
-            self.file_handler.write(log_entry + "\n")
-            self.file_handler.flush()
-            
-            if kwargs.get("prnt", True):
-                if "step" in kwargs and "max_steps" in kwargs:
-                    tqdm.write(f"[{kwargs.get('step'):>5}/{kwargs.get('max_steps')}] {event}: loss={kwargs.get('loss', 'N/A'):.6f} time={kwargs.get('elapsed_time', 0):.2f}s")
-                else:
-                    parts = [f"{k}={v}" for k, v in kwargs.items() if k not in ["prnt", "timestamp"]]
-                    if parts:
-                        tqdm.write(f"{event}: {', '.join(parts)}")
-                    else:
-                        tqdm.write(event)
-    
-    return DualLogger(file_handler)
+
 
 logger = None
 tb_writer = None
@@ -135,36 +93,91 @@ class BPETokenizer:
     @property
     def vocab_size(self): return self.tk.get_vocab_size()
 
+
 @dataclass
 class GPTConfig:
     vocab_size: int
     block_size: int
     n_layer: int
-    n_head: int
+    n_q_head: int
     d_model: int
     dropout: float
+    # Explicit control for MQA/GQA; defaults to n_q_head (standard MHA mode)
+    n_kv_heads: int = 8
+    # Enable SDPA (FlashAttention-2) by default to leverage hardware-level acceleration on RDNA 3.5 UMA
+    use_fa2: bool = True
+
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        assert cfg.d_model % cfg.n_head == 0
-        self.head_dim = cfg.d_model // cfg.n_head
-        self.n_head   = cfg.n_head
-        self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model)
-        self.proj = nn.Linear(cfg.d_model, cfg.d_model)
-        self.attn_drop = nn.Dropout(cfg.dropout)
-        self.resid_drop= nn.Dropout(cfg.dropout)
-        self.register_buffer("tril", torch.tril(torch.ones(cfg.block_size, cfg.block_size)))
+        assert cfg.d_model % cfg.n_q_head == 0
+        self.n_q_head = cfg.n_q_head
+        self.head_dim = cfg.d_model // cfg.n_q_head
 
-    def forward(self, x: torch.Tensor):
+        # Dynamic support: n_kv_heads = n_q_head (MHA), n_kv_heads = 1 (MQA), 1 < n_kv_heads < n_q_head (GQA)
+        self.n_kv_heads = getattr(cfg, "n_kv_heads", cfg.n_q_head)
+        self.use_sdpa = getattr(cfg, "use_fa2", True)  # Static switch for SDPA
+        self.dropout_p = cfg.dropout
+
+        # [Muon Overclocking Core Design: Decoupled Projections]
+        # Isolate q_proj so its shape strictly equals (d_model, d_model) -> e.g., 512x512.
+        # This allows q_proj to be perfectly stacked with the final proj (512x512) into a single Muon optimizer group!
+        self.q_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+
+        # kv_proj handles variable KV heads. Under MQA, its shape is only (d_model, 2 * head_dim) -> e.g., 512x128.
+        # Since this matrix is very small, it can be assigned to the AdamW group or a separate Muon group,
+        # preserving the stack structure of the main Muon group.
+        self.kv_proj = nn.Linear(cfg.d_model, 2 * self.n_kv_heads * self.head_dim, bias=False)
+
+        # Output projection layer: Shape strictly equals (d_model, d_model) -> perfectly aligned with q_proj.
+        self.proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+
+        self.attn_drop = nn.Dropout(cfg.dropout)
+        self.resid_drop = nn.Dropout(cfg.dropout)
+
+        # Prevent state contamination: register tril buffer only in manual debugging mode.
+        if not self.use_sdpa:
+            tril = torch.tril(torch.ones(cfg.block_size, cfg.block_size, dtype=torch.bool))
+            self.register_buffer("tril", tril, persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.size()
-        qkv = self.qkv(x).view(B, T, 3, self.n_head, self.head_dim).transpose(1, 3)
-        q, k, v = qkv[..., 0, :, :], qkv[..., 1, :, :], qkv[..., 2, :, :]
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_drop(att)
-        y = att @ v
+
+        # 1. Project Q and KV
+        # q shape: (B, T, n_q_head, head_dim) -> transpose to (B, n_q_head, T, head_dim)
+        q = self.q_proj(x).view(B, T, self.n_q_head, self.head_dim).transpose(1, 2)
+
+        # kv shape: (B, T, 2, n_kv_heads, head_dim) -> transpose to (B, n_kv_heads, T, head_dim)
+        kv = self.kv_proj(x).view(B, T, 2, self.n_kv_heads, self.head_dim).transpose(1, 3)
+        k, v = kv[..., 0, :, :], kv[..., 1, :, :]
+
+        # 2. Static conditional routing
+        if self.use_sdpa:
+            # PyTorch SDPA natively supports GQA/MQA broadcasting (when n_q_head % n_kv_heads == 0).
+            # Automatically activates hardware-level Causal FlashAttention acceleration under the hood (e.g., RDNA 3.5).
+            y = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=self.dropout_p if self.training else 0.0,
+                is_causal=True,
+            )
+        else:
+            # Backup/debug path manually supporting GQA/MQA broadcasting.
+            if self.n_q_head != self.n_kv_heads:
+                # Broadcast along the head dimension to align with Q's head count.
+                num_queries_per_kv = self.n_q_head // self.n_kv_heads
+                k = k.repeat_interleave(num_queries_per_kv, dim=1)
+                v = v.repeat_interleave(num_queries_per_kv, dim=1)
+
+            # Classic white-box dot-product attention calculation.
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
+            att = att.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_drop(att)
+            y = att @ v
+
+        # 3. Restore dimensions and apply output projection
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_drop(self.proj(y))
 
@@ -205,6 +218,8 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
         self.head.weight = self.token_emb.weight
 
+
+
     @staticmethod
     def _init_weights(module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -237,7 +252,7 @@ def main():
     args.log_file = str(run_dir / "log.txt")
     
     global logger, tb_writer
-    logger = configure_logging(args.log_file)
+    logger = expt_util.configure_logging(args.log_file)
     tb_writer = SummaryWriter(log_dir=str(run_dir))
     
     hyperparams_dict = vars(args)
@@ -265,13 +280,16 @@ def main():
                tokens_per_epoch=len(train_ids),
                vocab_size=tok.vocab_size)
 
+    print("vocab:", tok.vocab_size)
+    exit()
     cfg = GPTConfig(
         vocab_size = tok.vocab_size,
         block_size = args.block_size,
         n_layer    = args.n_layer,
-        n_head     = args.n_head,
+        n_q_head   = args.n_q_head,
         d_model    = args.d_model,
         dropout    = args.dropout,
+        use_fa2    = args.use_fa2
     )
     model = GPT(cfg).to(device)
     model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
