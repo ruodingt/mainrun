@@ -20,7 +20,7 @@ from tqdm import tqdm
 class Hyperparameters:
     block_size: int = 128
     batch_size: int = 64
-    vocab_size: int = 16_000
+    vocab_size: int = 8192
     n_layer: int = 6
     n_q_head: int = 8 # number of query head
     d_model: int = 512
