@@ -72,31 +72,35 @@ if HAS_TRITON:
         tl.store(y_base + (offsets + d_half) * stride_yd, y2, mask=mask)
 
 
-    def _apply_rope_gpu_triton(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        """
-        Apply RoPE using high-performance Triton kernel.
-        x: (B, H, T, D)
-        cos/sin: (1, 1, T, D // 2)
-        """
+    def _apply_rope_triton(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """Apply RoPE via Triton kernel. x: (B,H,T,D), cos/sin: (1,1,T,D//2)."""
         B, H, T, D = x.shape
-        # Squeeze cos/sin to 2D (T, D // 2) to simplify pointer arithmetic inside Triton
         cos_2d = cos.squeeze(0).squeeze(0)
         sin_2d = sin.squeeze(0).squeeze(0)
-
         y = torch.empty_like(x)
-        grid = (B * H, T)
-        # Select the next power of 2 as the block size
         BLOCK_D_HALF = triton.next_power_of_2(D // 2)
-
-        _rope_fwd_kernel[grid](
+        _rope_fwd_kernel[(B * H, T)](
             x, cos_2d, sin_2d, y,
             x.stride(0), x.stride(1), x.stride(2), x.stride(3),
             cos_2d.stride(0), cos_2d.stride(1),
             y.stride(0), y.stride(1), y.stride(2), y.stride(3),
-            H=H, T=T, D=D,
-            BLOCK_D_HALF=BLOCK_D_HALF
+            H=H, T=T, D=D, BLOCK_D_HALF=BLOCK_D_HALF,
         )
         return y
+
+    class _RoPEFn(torch.autograd.Function):
+        """Wrap Triton RoPE in autograd. Backward = same kernel with -sin (inverse rotation)."""
+        @staticmethod
+        def forward(ctx, x, cos, sin):
+            ctx.save_for_backward(cos, sin)
+            return _apply_rope_triton(x, cos, sin)
+
+        @staticmethod
+        def backward(ctx, dy):
+            cos, sin = ctx.saved_tensors
+            # R(θ)^T = R(-θ): rotate gradients by -θ
+            dx = _apply_rope_triton(dy.contiguous(), cos, -sin)
+            return dx, None, None
 
 
 # ==========================================
@@ -124,14 +128,7 @@ def _apply_rope_native(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) ->
 # 3. Unified Hardware-Adaptive Routing API
 # ==========================================
 def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """
-    Apply RoPE. Always uses the native differentiable path.
-
-    The Triton kernel above is forward-only (no autograd backward), so it would sever
-    the computation graph during training. A proper fix would wrap it in
-    torch.autograd.Function with backward = apply RoPE with -sin. Not done here since
-    this project only runs training, not inference.
-    """
+    """Apply RoPE. Native path is faster at training shapes; Triton path kept for reference - it's slower in AMD RDNA"""
     return _apply_rope_native(x, cos, sin)
 
 

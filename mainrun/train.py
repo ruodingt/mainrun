@@ -14,6 +14,8 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 import expt_util
+from kernels.fused_ce_v2 import fused_linear_ce_v2
+from kernels.rms_norm import TritonRMSNorm
 from optim import MuonAdamW
 from rope import apply_rotary_emb, RotaryEmbedding
 from tokenizer import BPETokenizer, train_tokenizer
@@ -52,6 +54,7 @@ class Hyperparameters:
     # irrelevant/minor to training / loss
     use_fa2: bool = True
     evals_per_epoch: int = 3
+    use_fused_ce: bool = False  # fused linear+CE kernel (memory efficient; ~0.6x speed on RDNA4, faster on CDNA3)
     use_compile: bool = True  # torch.compile with reduce-overhead (auto CUDA graphs); skip on CPU
     use_bf16: bool = True
     experiments_dir: str = "./experiments"
@@ -154,6 +157,7 @@ class GPTConfig:
     mlp_act: str = "relu_sq"
     # Enable SDPA (FlashAttention-2) by default to leverage hardware-level acceleration on RDNA 3.5 UMA
     use_fa2: bool = True
+    use_fused_ce: bool = False
 
 
 class CausalSelfAttention(nn.Module):
@@ -242,7 +246,7 @@ def _make_norm(d_model: int, use_rmsnorm: bool) -> nn.Module:
     #   - loses the re-centering property; can't shift the output distribution, only scale it
     #   - slightly less expressive in theory, though this rarely matters at this scale
     if use_rmsnorm:
-        return nn.RMSNorm(d_model)
+        return TritonRMSNorm(d_model)
     return nn.LayerNorm(d_model)
 
 
@@ -386,7 +390,15 @@ class GPT(nn.Module):
                 x = r * x + self.x0_lambdas[i] * x0
             x = block(x, cos_sin)
         x = self.ln_f(x)
-        # Cast to fp32 for numerically stable cross-entropy (safe under autocast too).
+        # Fused path: training only (grad enabled), skips materialising [BT, V] logits.
+        # Falls back to standard path for eval (no_grad) since evaluate() needs logits.
+        if self.cfg.use_fused_ce and targets is not None and torch.is_grad_enabled():
+            x_flat = x.view(-1, x.size(-1))
+            loss   = fused_linear_ce_v2(x_flat, self.head.weight, targets.view(-1),
+                                        logit_softcap=self.cfg.logit_softcap)
+            return None, loss
+
+        # Standard path (eval + use_fused_ce=False).
         logits = self.head(x).float()
         if self.cfg.logit_softcap > 0:
             logits = self.cfg.logit_softcap * torch.tanh(logits / self.cfg.logit_softcap)
@@ -462,6 +474,7 @@ def main():
         norm_emb=args.norm_emb,
         logit_softcap=args.logit_softcap,
         mlp_act=args.mlp_act,
+        use_fused_ce=args.use_fused_ce,
     )
     model = GPT(cfg).to(device)
     model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -503,6 +516,16 @@ def main():
         if id(p) in skip_ids:
             continue  # handled separately below
         if p.ndim >= 2:
+            # Muon orthogonalizes 2D weight matrices only. The current GPT has none
+            # other than 2D matrices, so this is a no-op guard today.
+            # TODO(hybrid/mamba): Mamba's depthwise conv1d.weight is 3D — it must NOT
+            # land in Muon (orthogonalizing a depthwise kernel diverges training).
+            # When wiring Mamba/HybridLM into this loop, route conv weights to AdamW
+            # (other_params), and SSM scalars A_log/D/dt_bias (1D) + ReZero scales here too.
+            assert p.ndim == 2, (
+                f"Muon group expects 2D matrices, got {name!r} with ndim={p.ndim}. "
+                f"Route this param to an AdamW group (see TODO above)."
+            )
             muon_groups.setdefault(tuple(p.shape), []).append(p)
         elif id(p) in scalar_ids:
             scalar_params.append(p)
