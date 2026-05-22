@@ -76,7 +76,7 @@ The MLP expands `d_model → 4*d_model`. Without scaling, the pre-activation var
 
 **Reality**: `lm_head.weight` is tied to `token_emb.weight` (weight tying saves 4.2M params). Writing to one overwrites the other. Independently initializing both would require untying — spending the exact 4.2M params saved by halving vocab size from 16384→8192.
 
-**Decision**: keep weight tying, accept `lm_head` inheriting `std=0.8`. Loss starts slightly below `ln(vocab_size)` but remains well above zero. Not a blocker.
+**Decision**: token_emb uses `std=0.02` (same as gpt2), NOT `std=0.8`. Weight tying means logit_std ≈ `emb_std² × sqrt(d_model)`. With std=0.8 and d_model=512: logit_std ≈ 14 → val_loss ≈ 100 at step 1 (confirmed experimentally). std=0.02 keeps initial logits well-behaved.
 
 **Future option (Plan C)**: untie weights, init `lm_head` to `std=0.001`. Re-evaluate if Plan B shows strong gains and we have parameter budget to spend.
 

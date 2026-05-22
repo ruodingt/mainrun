@@ -15,7 +15,7 @@ def get_or_create_experiment_dir(args, base_dir: str = "./experiments") -> Path:
     base_path = Path(base_dir)
     base_path.mkdir(parents=True, exist_ok=True)
 
-    fingerprint = args.get_fingerprint(ignore=['seed', 'log_file'])
+    fingerprint = args.get_fingerprint()
 
     # Scan existing expXXX directories
     existing_exps = []
@@ -57,36 +57,37 @@ def get_or_create_experiment_dir(args, base_dir: str = "./experiments") -> Path:
     return new_exp_path
 
 
-def create_run_dir(exp_dir: Path, seed: int) -> Path:
+def create_run_dir(exp_dir: Path, args) -> Path:
     """
     Creates a new runYY subdirectory inside the specified exp_dir.
-    Automatically increments the run number.
+    Saves full hyperparameter snapshot to run.yaml (results added later via save_run_results).
     """
-    # Scan existing runYY directories
-    existing_runs = []
-    for p in exp_dir.iterdir():
-        if p.is_dir() and p.name.startswith("run") and p.name[3:].isdigit():
-            existing_runs.append(p)
+    existing_runs = sorted(
+        [p for p in exp_dir.iterdir() if p.is_dir() and p.name.startswith("run") and p.name[3:].isdigit()],
+        key=lambda x: int(x.name[3:])
+    )
+    next_num = int(existing_runs[-1].name[3:]) + 1 if existing_runs else 1
 
-    # Sort them by their numeric ID
-    existing_runs.sort(key=lambda x: int(x.name[3:]))
+    run_path = exp_dir / f"run{next_num:02d}"
+    run_path.mkdir(parents=True, exist_ok=True)
 
-    # Get next run number
-    if existing_runs:
-        next_num = int(existing_runs[-1].name[3:]) + 1
-    else:
-        next_num = 1
+    import dataclasses
+    all_params = dataclasses.asdict(args)
+    all_params.pop('log_file', None)
+    with open(run_path / "run.yaml", 'w') as f:
+        yaml.safe_dump(all_params, f, default_flow_style=False, sort_keys=True)
 
-    new_run_name = f"run{next_num:02d}"
-    new_run_path = exp_dir / new_run_name
-    new_run_path.mkdir(parents=True, exist_ok=True)
+    return run_path
 
-    # Write run.yaml
-    run_yaml_path = new_run_path / "run.yaml"
+
+def save_run_results(run_dir: Path, val_loss: float, total_time_s: float):
+    """Append final training results to run.yaml."""
+    run_yaml_path = run_dir / "run.yaml"
+    with open(run_yaml_path, 'r') as f:
+        data = yaml.safe_load(f) or {}
+    data['results'] = {'val_loss': round(val_loss, 6), 'total_time_s': round(total_time_s, 1)}
     with open(run_yaml_path, 'w') as f:
-        yaml.safe_dump({"seed": seed}, f, default_flow_style=False)
-
-    return new_run_path
+        yaml.safe_dump(data, f, default_flow_style=False, sort_keys=True)
 
 
 def save_model_summary(model, exp_dir: Path, run_dir: Path):

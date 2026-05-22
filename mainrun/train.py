@@ -28,35 +28,42 @@ class Hyperparameters:
     n_q_head: int = 8  # number of query head
     d_model: int = 512
     dropout: float = 0.1
-    muon_lr: float = 0.02    # Muon: 2D weight matrices (attn, mlp)
-    adamw_lr: float = 3e-4   # AdamW: norms, biases, other 1D params
-    emb_lr: float = 3e-3     # AdamW: token_emb — sparse updates justify slightly higher LR than base
+    muon_lr: float = 0.02  # Muon: 2D weight matrices (attn, mlp)
+    adamw_lr: float = 3e-4  # AdamW: norms, biases, other 1D params
+    emb_lr: float = 3e-3  # AdamW: token_emb — sparse updates justify slightly higher LR than base
     scalar_lr: float = 1e-3  # AdamW: ReZero scalars, x0_lambdas
-    adamw_wd: float = 0.1    # weight decay for AdamW group only
+    adamw_wd: float = 0.1  # weight decay for AdamW group only
+    lr_schedule: str = "wsd"  # "wsd" (warmup→stable→decay) | "cosine" (warmup→cosine decay)
     warmup_frac: float = 0.05  # fraction of total steps for linear warmup
-    decay_frac: float = 0.20  # fraction of total steps for final cosine decay (WSD schedule)
+    decay_frac: float = 0.30  # WSD only: fraction of total steps for final cosine decay
     min_lr_frac: float = 0.0  # cosine decay floor; 0.0 = decay all the way to zero
-    evals_per_epoch: int = 3
 
-    use_fa2: bool = True
-    use_bf16: bool = True
-    use_compile: bool = True   # torch.compile with reduce-overhead (auto CUDA graphs); skip on CPU
-    use_rezero: bool = True   # learnable per-layer residual scalars (ReZero); init=0 → identity at step 0
+    use_rezero: bool = False  # learnable per-layer residual scalars (ReZero); init=0 → identity at step 0
     use_rmsnorm: bool = True  # RMSNorm instead of LayerNorm: faster, fewer params, no re-centering
-    use_x0: bool = True       # per-layer learnable skip from original token embedding; prevents token identity dilution with depth
-    weight_init: str = "gpt2"  # weight init: "gpt2" (Normal 0.02) | "muon_uniform" (Uniform + zero exits)
+    use_x0: bool = True  # per-layer learnable skip from original token embedding; prevents token identity dilution with depth
+    weight_init: str = "muon_uniform"  # weight init: "gpt2" (Normal 0.02) | "muon_uniform" (Uniform + zero exits; incompatible with use_rezero=True)
     n_kv_heads: int = 1  # n_kv_heads can be 1, 2, 4 to enable MQA
     mlp_act: str = "relu_sq"  # gelu
 
+    # irrelevant/minor to training / loss
+    use_fa2: bool = True
+    evals_per_epoch: int = 3
+    use_compile: bool = True  # torch.compile with reduce-overhead (auto CUDA graphs); skip on CPU
+    use_bf16: bool = True
+
+    # fixed
     epochs: int = 7
     seed: int = 1337
     num_titles: int = 100_000
     val_frac: float = 0.10
     log_file: str = "./logs/mainrun.log"
 
-    def get_fingerprint(self, ignore: list[str] | None = None) -> dict:
-        if ignore is None:
-            ignore = ['seed', 'use_compile']
+    # Fields that don't affect model quality — excluded from experiment fingerprint.
+    _INFRA = frozenset(['use_fa2', 'use_compile', 'use_bf16', 'evals_per_epoch', 'log_file'])
+    _FIXED = frozenset(['epochs', 'seed', 'num_titles', 'val_frac'])
+
+    def get_fingerprint(self) -> dict:
+        ignore = self._INFRA | self._FIXED
         return {k: v for k, v in vars(self).items() if k not in ignore}
 
 
@@ -281,7 +288,7 @@ class GPT(nn.Module):
 
     def _init_weights(self):
         _plans = {
-            "gpt2":         self._init_gpt2,
+            "gpt2": self._init_gpt2,
             "muon_uniform": self._init_muon_uniform,
         }
         assert self.cfg.weight_init in _plans, f"unknown weight_init: {self.cfg.weight_init!r}"
@@ -295,11 +302,11 @@ class GPT(nn.Module):
         # See docs/decisions/001-weight-init.md.
         nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
         for block in self.blocks:
-            nn.init.normal_(block.attn.q_proj.weight,  mean=0.0, std=0.02)
+            nn.init.normal_(block.attn.q_proj.weight, mean=0.0, std=0.02)
             nn.init.normal_(block.attn.kv_proj.weight, mean=0.0, std=0.02)
-            nn.init.normal_(block.attn.proj.weight,    mean=0.0, std=0.02)
-            nn.init.normal_(block.mlp.net[0].weight,   mean=0.0, std=0.02)
-            nn.init.normal_(block.mlp.net[2].weight,   mean=0.0, std=0.02)
+            nn.init.normal_(block.attn.proj.weight, mean=0.0, std=0.02)
+            nn.init.normal_(block.mlp.net[0].weight, mean=0.0, std=0.02)
+            nn.init.normal_(block.mlp.net[2].weight, mean=0.0, std=0.02)
 
     @torch.no_grad()
     def _init_muon_uniform(self):
@@ -308,17 +315,18 @@ class GPT(nn.Module):
         # Norms (RMSNorm/LayerNorm) keep their default init (weight=1, bias=0).
         # See docs/decisions/001-weight-init.md for full tradeoff analysis.
 
-        # token_emb: large std keeps token representations well-separated (AdamW group).
-        # lm_head is weight-tied to token_emb and inherits this value after __init__.
-        nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.8)
+        # token_emb: std=0.02 to keep initial logits small (lm_head is weight-tied,
+        # so token_emb std directly scales logit magnitude ~ std² * sqrt(d_model)).
+        # std=0.8 caused logit_std≈14 → loss≈100 at step 1.
+        nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
 
         for block in self.blocks:
             d = block.attn.q_proj.weight.shape[1]  # fan_in = d_model
-            s = 3**0.5 * d**-0.5                    # uniform bound s.t. std = 1/sqrt(fan_in)
+            s = 3 ** 0.5 * d ** -0.5  # uniform bound s.t. std = 1/sqrt(fan_in)
 
             # Uniform[-s, s]: same std as Normal(0, 1/sqrt(fan_in)) but no tails.
             # Flatter singular value spectrum → cleaner Polar Express orthogonalization.
-            nn.init.uniform_(block.attn.q_proj.weight,  -s, s)
+            nn.init.uniform_(block.attn.q_proj.weight, -s, s)
             nn.init.uniform_(block.attn.kv_proj.weight, -s, s)
 
             # Residual exits → zero: each Block is identity at step 0.
@@ -357,7 +365,7 @@ def main():
 
     # Resolve experiment and run directories
     exp_dir = expt_util.get_or_create_experiment_dir(args)
-    run_dir = expt_util.create_run_dir(exp_dir, args.seed)
+    run_dir = expt_util.create_run_dir(exp_dir, args)
     args.log_file = str(run_dir / "log.txt")
 
     global logger, tb_writer
@@ -457,9 +465,9 @@ def main():
         *[{'kind': 'muon', 'params': ps, 'lr': args.muon_lr,
            'momentum': 0.95, 'ns_steps': 5, 'beta2': 0.999, 'weight_decay': 0.0}
           for ps in muon_groups.values()],
-        {**adamw_shared, 'params': emb_params,    'lr': args.emb_lr},
-        {**adamw_shared, 'params': scalar_params,  'lr': args.scalar_lr},
-        {**adamw_shared, 'params': other_params,   'lr': args.adamw_lr},
+        {**adamw_shared, 'params': emb_params, 'lr': args.emb_lr},
+        {**adamw_shared, 'params': scalar_params, 'lr': args.scalar_lr},
+        {**adamw_shared, 'params': other_params, 'lr': args.adamw_lr},
     ]
     opt = MuonAdamW(param_groups, compute_dtype=compute_dtype)
 
@@ -469,18 +477,26 @@ def main():
     if args.use_compile and device != "cpu":
         model = torch.compile(model, mode="reduce-overhead")
 
-    # WSD schedule: warmup → stable (full LR) → cosine decay to min_lr_frac.
+    assert args.lr_schedule in ("wsd", "cosine"), f"unknown lr_schedule: {args.lr_schedule!r}"
     warmup_steps = int(max_steps * args.warmup_frac)
-    decay_steps  = int(max_steps * args.decay_frac)
-    stable_steps = max_steps - warmup_steps - decay_steps
 
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return step / max(warmup_steps, 1)
-        if step < warmup_steps + stable_steps:
-            return 1.0
-        progress = (step - warmup_steps - stable_steps) / max(decay_steps, 1)
-        return args.min_lr_frac + (1 - args.min_lr_frac) * 0.5 * (1 + math.cos(math.pi * progress))
+    if args.lr_schedule == "wsd":
+        decay_steps = int(max_steps * args.decay_frac)
+        stable_steps = max_steps - warmup_steps - decay_steps
+
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return step / max(warmup_steps, 1)
+            if step < warmup_steps + stable_steps:
+                return 1.0
+            progress = (step - warmup_steps - stable_steps) / max(decay_steps, 1)
+            return args.min_lr_frac + (1 - args.min_lr_frac) * 0.5 * (1 + math.cos(math.pi * progress))
+    else:  # cosine
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return step / max(warmup_steps, 1)
+            progress = (step - warmup_steps) / max(max_steps - warmup_steps, 1)
+            return args.min_lr_frac + (1 - args.min_lr_frac) * 0.5 * (1 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
 
@@ -521,8 +537,8 @@ def main():
             t1 = time.time()
 
             step_time = t1 - step_start
-            data_time = t_data - step_start   # CPU: data fetch + H2D transfer
-            compute_time = t1 - t_data        # GPU: forward + backward + optimizer
+            data_time = t_data - step_start  # CPU: data fetch + H2D transfer
+            compute_time = t1 - t_data  # GPU: forward + backward + optimizer
             elapsed = t1 - t0
 
             # Calculate performance metrics
@@ -547,10 +563,10 @@ def main():
 
             if tb_writer:
                 tb_writer.add_scalar("Loss/train", loss.item(), step)
-                tb_writer.add_scalar("Charts/muon_lr",   opt.param_groups[0]['lr'], step)
-                tb_writer.add_scalar("Charts/emb_lr",    opt.param_groups[-3]['lr'], step)
+                tb_writer.add_scalar("Charts/muon_lr", opt.param_groups[0]['lr'], step)
+                tb_writer.add_scalar("Charts/emb_lr", opt.param_groups[-3]['lr'], step)
                 tb_writer.add_scalar("Charts/scalar_lr", opt.param_groups[-2]['lr'], step)
-                tb_writer.add_scalar("Charts/adamw_lr",  opt.param_groups[-1]['lr'], step)
+                tb_writer.add_scalar("Charts/adamw_lr", opt.param_groups[-1]['lr'], step)
                 tb_writer.add_scalar("Throughput/local_tokens_per_sec", local_tokens_per_sec, step)
                 tb_writer.add_scalar("Throughput/avg_tokens_per_sec", avg_tokens_per_sec, step)
                 tb_writer.add_scalar("Bottleneck/data_ms", data_time * 1000, step)
@@ -581,7 +597,7 @@ def main():
     if tb_writer:
         from torch.utils.tensorboard.summary import hparams as tb_hparams
         total_time_min = (time.time() - t0) / 60
-        hparam_dict = args.get_fingerprint(ignore=['log_file'])
+        hparam_dict = args.get_fingerprint()
         metric_dict = {
             "Loss/val_final": val_loss,
             "Perf/total_time_min": total_time_min,
@@ -591,6 +607,8 @@ def main():
         tb_writer.file_writer.add_summary(exp)
         tb_writer.file_writer.add_summary(ssi)
         tb_writer.file_writer.add_summary(sei)
+
+    expt_util.save_run_results(run_dir, val_loss, time.time() - t0)
 
 
 if __name__ == "__main__":
