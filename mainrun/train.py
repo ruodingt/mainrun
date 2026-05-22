@@ -1,43 +1,50 @@
 # import utils
-import math, random, time
+import math
 import os
+import random
+import time
 from dataclasses import dataclass
 from typing import Any
 
-import expt_util
-from rope import apply_rotary_emb, RotaryEmbedding
-from optim import MuonAdamW
-
 import torch
-from torch.utils.tensorboard import SummaryWriter
 import torch.nn as nn
-from torch.nn import functional as F
 from datasets import load_dataset
+from torch.nn import functional as F
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+import expt_util
+from optim import MuonAdamW
+from rope import apply_rotary_emb, RotaryEmbedding
 from tokenizer import BPETokenizer, train_tokenizer
 
 
 @dataclass
 class Hyperparameters:
-    block_size: int = 128
-    batch_size: int = 64
+    block_size: int = 64
+    batch_size: int = 128
     vocab_size: int = 8192
     n_layer: int = 6
-    n_q_head: int = 8 # number of query head
+    n_q_head: int = 8  # number of query head
     d_model: int = 512
     dropout: float = 0.1
-    muon_lr: float = 0.02      # Muon: 2D weight matrices (attn, mlp)
-    adamw_lr: float = 3e-4     # AdamW: embeddings, norms, biases
-    adamw_wd: float = 0.1      # weight decay for AdamW group only
+    muon_lr: float = 0.02  # Muon: 2D weight matrices (attn, mlp)
+    adamw_lr: float = 3e-4  # AdamW: embeddings, norms, biases
+    adamw_wd: float = 0.1  # weight decay for AdamW group only
     warmup_frac: float = 0.05  # fraction of total steps for linear warmup
-    min_lr_frac: float = 0.1   # cosine decay floor as fraction of peak lr
+    min_lr_frac: float = 0.1  # cosine decay floor as fraction of peak lr
     evals_per_epoch: int = 3
 
     use_fa2: bool = True
     use_bf16: bool = True
-    n_kv_heads: int = 1 # n_kv_heads can be 1, 2, 4 to enable MQA
-    
+    use_compile: bool = True   # torch.compile with reduce-overhead (auto CUDA graphs); skip on CPU
+    use_rezero: bool = True   # learnable per-layer residual scalars (ReZero); init=0 → identity at step 0
+    use_rmsnorm: bool = True  # RMSNorm instead of LayerNorm: faster, fewer params, no re-centering
+    use_x0: bool = True       # per-layer learnable skip from original token embedding; prevents token identity dilution with depth
+    weight_init: str = "gpt2"  # weight init: "gpt2" (Normal 0.02) | "muon_uniform" (Uniform + zero exits)
+    n_kv_heads: int = 1  # n_kv_heads can be 1, 2, 4 to enable MQA
+    mlp_act: str = "relu_sq"  # gelu
+
     epochs: int = 7
     seed: int = 1337
     num_titles: int = 100_000
@@ -46,12 +53,12 @@ class Hyperparameters:
 
     def get_fingerprint(self, ignore: list[str] | None = None) -> dict:
         if ignore is None:
-            ignore = ['seed']
+            ignore = ['seed', 'use_compile']
         return {k: v for k, v in vars(self).items() if k not in ignore}
 
 
-
 import contextlib
+
 
 def make_autocast(device: str, dtype: torch.dtype | None):
     if dtype is not None:
@@ -62,11 +69,13 @@ def make_autocast(device: str, dtype: torch.dtype | None):
 logger = None
 tb_writer = None
 
+
 def get_titles(num_titles: int, seed: int, val_frac: float) -> tuple[list[Any], list[Any]]:
     ds = load_dataset("julien040/hacker-news-posts", split="train", cache_dir="./data").shuffle(seed=seed)
     titles = [row["title"].strip() for row in ds.take(num_titles)]
     n = int(num_titles * (1 - val_frac))
     return titles[:n], titles[n:]
+
 
 def get_batch(split_ids: torch.Tensor, ptr: int, block_size: int, batch_size: int, device: torch.device):
     span = block_size * batch_size + 1
@@ -76,6 +85,7 @@ def get_batch(split_ids: torch.Tensor, ptr: int, block_size: int, batch_size: in
     x = batch[:-1].view(batch_size, block_size).to(device)
     y = batch[1:].view(batch_size, block_size).to(device)
     return x, y, ptr + block_size * batch_size
+
 
 def iter_full_split(split_ids: torch.Tensor, block_size: int, batch_size: int, device: torch.device):
     span = block_size * batch_size + 1
@@ -96,6 +106,11 @@ class GPTConfig:
     dropout: float
     # Explicit control for MQA/GQA; defaults to n_q_head (standard MHA mode)
     n_kv_heads: int = 8
+    use_rezero: bool = True
+    use_rmsnorm: bool = True
+    use_x0: bool = True
+    weight_init: str = "gpt2"
+    mlp_act: str = "relu_sq"
     # Enable SDPA (FlashAttention-2) by default to leverage hardware-level acceleration on RDNA 3.5 UMA
     use_fa2: bool = True
 
@@ -176,59 +191,151 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_drop(self.proj(y))
 
+
+def _make_norm(d_model: int, use_rmsnorm: bool) -> nn.Module:
+    # RMSNorm normalizes by root-mean-square only — no mean-centering, no bias term.
+    # Tradeoff vs LayerNorm:
+    #   + ~15% faster (skips mean subtraction and bias addition)
+    #   + fewer parameters: saves d_model params per norm (no bias vector)
+    #   + empirically matches or beats LayerNorm in practice (LLaMA, Mistral, Gemma all use it)
+    #   - loses the re-centering property; can't shift the output distribution, only scale it
+    #   - slightly less expressive in theory, though this rarely matters at this scale
+    if use_rmsnorm:
+        return nn.RMSNorm(d_model)
+    return nn.LayerNorm(d_model)
+
+
+class ReLUSquared(nn.Module):
+    def forward(self, x):
+        return torch.relu(x).square()
+
+
 class MLP(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
+
+        _actv = {
+            'relu_sq': ReLUSquared(),
+            'gelu': nn.GELU(),
+        }
+
+        #  torch.compile -> kernel fusion。
         self.net = nn.Sequential(
             nn.Linear(cfg.d_model, 4 * cfg.d_model),
-            nn.GELU(),
+            _actv[cfg.mlp_act],
             nn.Linear(4 * cfg.d_model, cfg.d_model),
             nn.Dropout(cfg.dropout),
         )
+
     def forward(self, x): return self.net(x)
+
 
 class Block(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        self.ln1 = nn.LayerNorm(cfg.d_model)
-        self.ln2 = nn.LayerNorm(cfg.d_model)
+        self.ln1 = _make_norm(cfg.d_model, cfg.use_rmsnorm)
+        self.ln2 = _make_norm(cfg.d_model, cfg.use_rmsnorm)
         self.attn = CausalSelfAttention(cfg)
-        self.mlp  = MLP(cfg)
+        self.mlp = MLP(cfg)
+        self.use_rezero = cfg.use_rezero
+        if self.use_rezero:
+            self.attn_scale = nn.Parameter(torch.zeros(1))
+            self.mlp_scale = nn.Parameter(torch.zeros(1))
+
     def forward(self, x, cos_sin):
-        x = x + self.attn(self.ln1(x), cos_sin)
-        x = x + self.mlp(self.ln2(x))
+        if self.use_rezero:
+            x = x + self.attn_scale * self.attn(self.ln1(x), cos_sin)
+            x = x + self.mlp_scale * self.mlp(self.ln2(x))
+        else:
+            x = x + self.attn(self.ln1(x), cos_sin)
+            x = x + self.mlp(self.ln2(x))
         return x
+
 
 class GPT(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         self.cfg = cfg
         self.token_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.drop      = nn.Dropout(cfg.dropout)
+        self.drop = nn.Dropout(cfg.dropout)
 
         head_dim = cfg.d_model // cfg.n_q_head
         self.rope = RotaryEmbedding(head_dim, max_seq_len=cfg.block_size)
-        self.blocks    = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
-        self.ln_f      = nn.LayerNorm(cfg.d_model)
-        self.head      = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+        self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
+        self.ln_f = _make_norm(cfg.d_model, cfg.use_rmsnorm)
+        self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
 
-        self.apply(self._init_weights)
+        if cfg.use_x0:
+            # Per-layer learnable scalars: each block gets a direct skip from the original
+            # token embedding x0. Prevents token identity from being washed out by depth.
+            # Init decays layer-by-layer: early layers need more x0 signal (0.20),
+            # deep layers trust their own representations more (0.05). From nanoamd.
+            x0_init = torch.linspace(0.20, 0.05, cfg.n_layer)
+            self.x0_lambdas = nn.Parameter(x0_init)
+
+        self._init_weights()
         self.head.weight = self.token_emb.weight
 
+    def _init_weights(self):
+        _plans = {
+            "gpt2":         self._init_gpt2,
+            "muon_uniform": self._init_muon_uniform,
+        }
+        assert self.cfg.weight_init in _plans, f"unknown weight_init: {self.cfg.weight_init!r}"
+        _plans[self.cfg.weight_init]()
 
+    def _init_gpt2(self):
+        # GPT-2 style: Normal(0, 0.02) for all weights.
+        # Simple baseline; works with AdamW. Under Muon the fixed std=0.02 is arbitrary
+        # but acceptable — Muon orthogonalizes within a few steps regardless.
+        # Norms keep default init (weight=1, bias=0).
+        # See docs/decisions/001-weight-init.md.
+        nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
+        for block in self.blocks:
+            nn.init.normal_(block.attn.q_proj.weight,  mean=0.0, std=0.02)
+            nn.init.normal_(block.attn.kv_proj.weight, mean=0.0, std=0.02)
+            nn.init.normal_(block.attn.proj.weight,    mean=0.0, std=0.02)
+            nn.init.normal_(block.mlp.net[0].weight,   mean=0.0, std=0.02)
+            nn.init.normal_(block.mlp.net[2].weight,   mean=0.0, std=0.02)
 
-    @staticmethod
-    def _init_weights(module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if isinstance(module, nn.Linear) and module.bias is not None:
-                nn.init.zeros_(module.bias)
+    @torch.no_grad()
+    def _init_muon_uniform(self):
+        # Muon-aware init: Uniform + fan-in scaling + zero residual exits.
+        # Every parameter is set explicitly — no hidden base-pass overrides.
+        # Norms (RMSNorm/LayerNorm) keep their default init (weight=1, bias=0).
+        # See docs/decisions/001-weight-init.md for full tradeoff analysis.
+
+        # token_emb: large std keeps token representations well-separated (AdamW group).
+        # lm_head is weight-tied to token_emb and inherits this value after __init__.
+        nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.8)
+
+        for block in self.blocks:
+            d = block.attn.q_proj.weight.shape[1]  # fan_in = d_model
+            s = 3**0.5 * d**-0.5                    # uniform bound s.t. std = 1/sqrt(fan_in)
+
+            # Uniform[-s, s]: same std as Normal(0, 1/sqrt(fan_in)) but no tails.
+            # Flatter singular value spectrum → cleaner Polar Express orthogonalization.
+            nn.init.uniform_(block.attn.q_proj.weight,  -s, s)
+            nn.init.uniform_(block.attn.kv_proj.weight, -s, s)
+
+            # Residual exits → zero: each Block is identity at step 0.
+            # Muon grows these from zero via orthogonalized gradient direction.
+            nn.init.zeros_(block.attn.proj.weight)
+
+            # MLP up: 0.4x scale compensates 4x dim expansion (d_model → 4*d_model).
+            # MLP down: zero exit, same reasoning as attn.proj.
+            nn.init.uniform_(block.mlp.net[0].weight, -s * 0.4, s * 0.4)
+            nn.init.zeros_(block.mlp.net[2].weight)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         B, T = idx.size()
-        x = self.drop(self.token_emb(idx))
+        x0 = self.drop(self.token_emb(idx))  # original token embedding, saved for x0 skip
+        x = x0
         cos_sin = self.rope(x, T)
-        for block in self.blocks: x = block(x, cos_sin)
+        for i, block in enumerate(self.blocks):
+            x = block(x, cos_sin)
+            if self.cfg.use_x0:
+                x = x + self.x0_lambdas[i] * x0  # direct skip: token identity anchor
         x = self.ln_f(x)
         # Cast to fp32 for numerically stable cross-entropy (safe under autocast too).
         logits = self.head(x).float()
@@ -238,35 +345,37 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction='mean')
         return logits, loss
 
+
 def main():
     args = Hyperparameters()
     torch.manual_seed(args.seed)
     random.seed(args.seed)
-    
+    # TF32 is NVIDIA-only; no-op on AMD ROCm. Skip to avoid triggering hipBLASLt paths.
+
     # Resolve experiment and run directories
     exp_dir = expt_util.get_or_create_experiment_dir(args)
     run_dir = expt_util.create_run_dir(exp_dir, args.seed)
     args.log_file = str(run_dir / "log.txt")
-    
+
     global logger, tb_writer
     logger = expt_util.configure_logging(args.log_file)
     tb_writer = SummaryWriter(log_dir=str(run_dir))
-    
+
     hyperparams_dict = vars(args)
     logger.log("hyperparameters_configured", **hyperparams_dict)
-    
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.log("device_info", device=device)
 
     train_titles, val_titles = get_titles(args.num_titles, args.seed, args.val_frac)
-    
+
     eos_token = "<eos>"
     tok = BPETokenizer(train_tokenizer(train_titles + val_titles, args.vocab_size, eos_token=eos_token))
     train_text = eos_token.join(train_titles) + eos_token
     val_text = eos_token.join(val_titles) + eos_token
     train_ids = torch.tensor(tok.encode(train_text), dtype=torch.long)
     val_ids = torch.tensor(tok.encode(val_text), dtype=torch.long)
-    
+
     batches = len(train_ids) // (args.block_size * args.batch_size)
     max_steps = args.epochs * batches
     eval_interval = batches // args.evals_per_epoch
@@ -280,14 +389,19 @@ def main():
     print("vocab:", tok.vocab_size)
     # exit()
     cfg = GPTConfig(
-        vocab_size  = tok.vocab_size,
-        block_size  = args.block_size,
-        n_layer     = args.n_layer,
-        n_q_head    = args.n_q_head,
-        n_kv_heads  = args.n_kv_heads,
-        d_model     = args.d_model,
-        dropout     = args.dropout,
-        use_fa2     = args.use_fa2,
+        vocab_size=tok.vocab_size,
+        block_size=args.block_size,
+        n_layer=args.n_layer,
+        n_q_head=args.n_q_head,
+        n_kv_heads=args.n_kv_heads,
+        d_model=args.d_model,
+        dropout=args.dropout,
+        use_fa2=args.use_fa2,
+        use_rezero=args.use_rezero,
+        use_rmsnorm=args.use_rmsnorm,
+        use_x0=args.use_x0,
+        weight_init=args.weight_init,
+        mlp_act=args.mlp_act,
     )
     model = GPT(cfg).to(device)
     model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -327,13 +441,21 @@ def main():
     ]
     opt = MuonAdamW(param_groups, compute_dtype=compute_dtype)
 
+    # torch.compile: fuses kernels and (with reduce-overhead) captures CUDA graphs.
+    # Must happen AFTER param groups are collected — optimizer holds refs to original params.
+    # Skip on CPU (compile gives no benefit and slows startup).
+    if args.use_compile and device != "cpu":
+        model = torch.compile(model, mode="reduce-overhead")
+
     # Linear warmup then cosine decay to min_lr_frac * peak_lr.
     warmup_steps = int(max_steps * args.warmup_frac)
+
     def lr_lambda(step):
         if step < warmup_steps:
             return step / max(warmup_steps, 1)
         progress = (step - warmup_steps) / max(max_steps - warmup_steps, 1)
         return args.min_lr_frac + (1 - args.min_lr_frac) * 0.5 * (1 + math.cos(math.pi * progress))
+
     scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
 
     def evaluate():
@@ -357,7 +479,10 @@ def main():
         for _ in tqdm(range(1, batches + 1), desc=f"Epoch {epoch}/{args.epochs}"):
             step_start = time.time()
             step += 1
+
             xb, yb, ptr = get_batch(train_ids, ptr, args.block_size, args.batch_size, device)
+            t_data = time.time()
+
             with make_autocast(device, amp_dtype):
                 _, loss = model(xb, yb)
             opt.zero_grad(set_to_none=True)
@@ -365,15 +490,19 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             scheduler.step()
-
+            if device != "cpu":
+                torch.cuda.synchronize()  # wait for GPU before stopping the clock
             t1 = time.time()
+
             step_time = t1 - step_start
+            data_time = t_data - step_start   # CPU: data fetch + H2D transfer
+            compute_time = t1 - t_data        # GPU: forward + backward + optimizer
             elapsed = t1 - t0
-            
+
             # Calculate performance metrics
             local_tokens_per_sec = tokens_per_step / step_time if step_time > 0 else 0.0
             avg_tokens_per_sec = (step * tokens_per_step) / elapsed if elapsed > 0 else 0.0
-            
+
             if torch.cuda.is_available():
                 allocated_gb = torch.cuda.memory_allocated() / 1e9
                 reserved_gb = torch.cuda.memory_reserved() / 1e9
@@ -384,11 +513,11 @@ def main():
                 max_allocated_gb = 0.0
 
             logger.log("training_step",
-                      step=step,
-                      max_steps=max_steps,
-                      loss=loss.item(),
-                      elapsed_time=elapsed,
-                      prnt=False)
+                       step=step,
+                       max_steps=max_steps,
+                       loss=loss.item(),
+                       elapsed_time=elapsed,
+                       prnt=False)
 
             if tb_writer:
                 tb_writer.add_scalar("Loss/train", loss.item(), step)
@@ -396,6 +525,9 @@ def main():
                 tb_writer.add_scalar("Charts/adamw_lr", opt.param_groups[-1]['lr'], step)
                 tb_writer.add_scalar("Throughput/local_tokens_per_sec", local_tokens_per_sec, step)
                 tb_writer.add_scalar("Throughput/avg_tokens_per_sec", avg_tokens_per_sec, step)
+                tb_writer.add_scalar("Bottleneck/data_ms", data_time * 1000, step)
+                tb_writer.add_scalar("Bottleneck/compute_ms", compute_time * 1000, step)
+                tb_writer.add_scalar("Bottleneck/data_pct", data_time / step_time * 100, step)
                 tb_writer.add_scalar("Memory/allocated_GB", allocated_gb, step)
                 tb_writer.add_scalar("Memory/reserved_GB", reserved_gb, step)
                 tb_writer.add_scalar("Memory/max_allocated_GB", max_allocated_gb, step)
@@ -403,11 +535,11 @@ def main():
             if step == 1 or step % eval_interval == 0 or step == max_steps:
                 val_loss = evaluate()
                 logger.log("validation_step",
-                          step=step,
-                          max_steps=max_steps,
-                          loss=val_loss,
-                          elapsed_time=elapsed)
-                
+                           step=step,
+                           max_steps=max_steps,
+                           loss=val_loss,
+                           elapsed_time=elapsed)
+
                 if tb_writer:
                     tb_writer.add_scalar("Loss/val", val_loss, step)
 
@@ -423,17 +555,22 @@ def main():
         total_time_min = (time.time() - t0) / 60
         hparam_dict = args.get_fingerprint(ignore=['log_file'])
         metric_dict = {
-            "Loss/val_final":      val_loss,
+            "Loss/val_final": val_loss,
             "Perf/total_time_min": total_time_min,
-            "Model/param_count":   float(model_params),
+            "Model/param_count": float(model_params),
         }
         exp, ssi, sei = tb_hparams(hparam_dict, metric_dict)
         tb_writer.file_writer.add_summary(exp)
         tb_writer.file_writer.add_summary(ssi)
         tb_writer.file_writer.add_summary(sei)
 
+
 if __name__ == "__main__":
     os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
+    # hipBLASLt rejects certain small/non-standard matrix shapes common in this model
+    # (e.g. bmm with head_dim=64, MQA kv shapes). Fall back to standard hipBLAS which
+    # supports all shapes. No accuracy loss; avoids noisy HIPBLAS_STATUS_NOT_SUPPORTED warnings.
+    os.environ["TORCH_BLAS_PREFER_HIPBLASLT"] = "0"
     try:
         main()
     finally:

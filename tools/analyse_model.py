@@ -143,7 +143,7 @@ def analyze_model_parameters(model: nn.Module, world_size: int = 1):
 
 if __name__ == "__main__":
     # Create mock configuration mimicking your train.py configuration
-    args = Hyperparameters(n_kv_heads=1)
+    args = Hyperparameters(n_kv_heads=1, n_layer=8)
 
     config = GPTConfig(
         vocab_size=args.vocab_size,
