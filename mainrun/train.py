@@ -36,12 +36,16 @@ class Hyperparameters:
     lr_schedule: str = "wsd"  # "wsd" (warmup→stable→decay) | "cosine" (warmup→cosine decay)
     warmup_frac: float = 0.05  # fraction of total steps for linear warmup
     decay_frac: float = 0.30  # WSD only: fraction of total steps for final cosine decay
-    min_lr_frac: float = 0.0  # cosine decay floor; 0.0 = decay all the way to zero
+    min_lr_frac: float = 0.0  # decay floor; 0.0 = decay all the way to zero
 
     use_rezero: bool = False  # learnable per-layer residual scalars (ReZero); init=0 → identity at step 0
     use_rmsnorm: bool = True  # RMSNorm instead of LayerNorm: faster, fewer params, no re-centering
-    use_x0: bool = True  # per-layer learnable skip from original token embedding; prevents token identity dilution with depth
+    use_token_anchor: bool = True  # per-layer learnable skip from original token embedding; prevents token identity dilution with depth
+    use_resid_scale: bool = False  # per-layer residual stream scaling (nanochat resid_lambdas); init 1.15→1.05; requires use_token_anchor=True
     weight_init: str = "muon_uniform"  # weight init: "gpt2" (Normal 0.02) | "muon_uniform" (Uniform + zero exits; incompatible with use_rezero=True)
+    tie_weights: bool = True          # tie lm_head to token_emb; saves vocab*d_model params but prevents independent init
+    norm_emb: bool = False            # apply RMSNorm after embedding (nanochat style); required for token_emb std=0.8 to work safely
+    logit_softcap: float = 15.0       # tanh softcap on logits; 0.0 = disabled
     n_kv_heads: int = 1  # n_kv_heads can be 1, 2, 4 to enable MQA
     mlp_act: str = "relu_sq"  # gelu
 
@@ -50,6 +54,7 @@ class Hyperparameters:
     evals_per_epoch: int = 3
     use_compile: bool = True  # torch.compile with reduce-overhead (auto CUDA graphs); skip on CPU
     use_bf16: bool = True
+    experiments_dir: str = "./experiments"
 
     # fixed
     epochs: int = 7
@@ -59,7 +64,7 @@ class Hyperparameters:
     log_file: str = "./logs/mainrun.log"
 
     # Fields that don't affect model quality — excluded from experiment fingerprint.
-    _INFRA = frozenset(['use_fa2', 'use_compile', 'use_bf16', 'evals_per_epoch', 'log_file'])
+    _INFRA = frozenset(['use_fa2', 'use_compile', 'use_bf16', 'evals_per_epoch', 'experiments_dir', 'log_file'])
     _FIXED = frozenset(['epochs', 'seed', 'num_titles', 'val_frac'])
 
     def get_fingerprint(self) -> dict:
@@ -80,6 +85,28 @@ logger = None
 tb_writer = None
 
 
+def disk_cache(cache_dir: str = "./data"):
+    import hashlib, json, pickle
+    from pathlib import Path
+    def decorator(fn):
+        def wrapper(*args, **kwargs):
+            key = hashlib.md5(
+                json.dumps({"args": args, "kwargs": kwargs}, sort_keys=True, default=str).encode()
+            ).hexdigest()[:12]
+            path = Path(cache_dir) / f"{fn.__name__}_{key}.pkl"
+            if path.exists():
+                with open(path, "rb") as f:
+                    return pickle.load(f)
+            result = fn(*args, **kwargs)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "wb") as f:
+                pickle.dump(result, f)
+            return result
+        return wrapper
+    return decorator
+
+
+@disk_cache("./data")
 def get_titles(num_titles: int, seed: int, val_frac: float) -> tuple[list[Any], list[Any]]:
     ds = load_dataset("julien040/hacker-news-posts", split="train", cache_dir="./data").shuffle(seed=seed)
     titles = [row["title"].strip() for row in ds.take(num_titles)]
@@ -118,8 +145,12 @@ class GPTConfig:
     n_kv_heads: int = 8
     use_rezero: bool = True
     use_rmsnorm: bool = True
-    use_x0: bool = True
+    use_token_anchor: bool = True
+    use_resid_scale: bool = True
     weight_init: str = "gpt2"
+    tie_weights: bool = True
+    norm_emb: bool = False
+    logit_softcap: float = 15.0
     mlp_act: str = "relu_sq"
     # Enable SDPA (FlashAttention-2) by default to leverage hardware-level acceleration on RDNA 3.5 UMA
     use_fa2: bool = True
@@ -275,16 +306,19 @@ class GPT(nn.Module):
         self.ln_f = _make_norm(cfg.d_model, cfg.use_rmsnorm)
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
 
-        if cfg.use_x0:
-            # Per-layer learnable scalars: each block gets a direct skip from the original
-            # token embedding x0. Prevents token identity from being washed out by depth.
-            # Init decays layer-by-layer: early layers need more x0 signal (0.20),
-            # deep layers trust their own representations more (0.05). From nanoamd.
-            x0_init = torch.linspace(0.20, 0.05, cfg.n_layer)
-            self.x0_lambdas = nn.Parameter(x0_init)
+        if cfg.use_token_anchor:
+            # nanochat-style: before each block, scale residual + inject original embedding.
+            # x0_lambdas: decaying blend of original token embedding (0.20→0.05).
+            self.x0_lambdas = nn.Parameter(torch.linspace(0.20, 0.05, cfg.n_layer))
+        if cfg.use_resid_scale:
+            # resid_lambdas: slight amplification (1.15→1.05) biases toward preserving info.
+            # Applied before each block together with x0 (requires use_token_anchor=True).
+            assert cfg.use_token_anchor, "use_resid_scale requires use_token_anchor=True"
+            self.resid_lambdas = nn.Parameter(torch.linspace(1.15, 1.05, cfg.n_layer))
 
         self._init_weights()
-        self.head.weight = self.token_emb.weight
+        if cfg.tie_weights:
+            self.head.weight = self.token_emb.weight
 
     def _init_weights(self):
         _plans = {
@@ -296,11 +330,11 @@ class GPT(nn.Module):
 
     def _init_gpt2(self):
         # GPT-2 style: Normal(0, 0.02) for all weights.
-        # Simple baseline; works with AdamW. Under Muon the fixed std=0.02 is arbitrary
-        # but acceptable — Muon orthogonalizes within a few steps regardless.
         # Norms keep default init (weight=1, bias=0).
         # See docs/decisions/001-weight-init.md.
         nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
+        if not self.cfg.tie_weights:
+            nn.init.normal_(self.head.weight, mean=0.0, std=0.02)
         for block in self.blocks:
             nn.init.normal_(block.attn.q_proj.weight, mean=0.0, std=0.02)
             nn.init.normal_(block.attn.kv_proj.weight, mean=0.0, std=0.02)
@@ -315,10 +349,11 @@ class GPT(nn.Module):
         # Norms (RMSNorm/LayerNorm) keep their default init (weight=1, bias=0).
         # See docs/decisions/001-weight-init.md for full tradeoff analysis.
 
-        # token_emb: std=0.02 to keep initial logits small (lm_head is weight-tied,
-        # so token_emb std directly scales logit magnitude ~ std² * sqrt(d_model)).
-        # std=0.8 caused logit_std≈14 → loss≈100 at step 1.
+        # token_emb: std=0.02 (safe with tied lm_head).
+        # For std=0.8 (nanochat style), use tie_weights=False + norm_emb=True together.
         nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
+        if not self.cfg.tie_weights:
+            nn.init.normal_(self.head.weight, mean=0.0, std=0.001)
 
         for block in self.blocks:
             d = block.attn.q_proj.weight.shape[1]  # fan_in = d_model
@@ -340,16 +375,21 @@ class GPT(nn.Module):
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         B, T = idx.size()
-        x0 = self.drop(self.token_emb(idx))  # original token embedding, saved for x0 skip
+        x0 = self.drop(self.token_emb(idx))
+        if self.cfg.norm_emb:
+            x0 = self.ln_f(x0)  # normalize embedding before use as anchor (nanochat style)
         x = x0
         cos_sin = self.rope(x, T)
         for i, block in enumerate(self.blocks):
+            if self.cfg.use_token_anchor:
+                r = self.resid_lambdas[i] if self.cfg.use_resid_scale else 1.0
+                x = r * x + self.x0_lambdas[i] * x0
             x = block(x, cos_sin)
-            if self.cfg.use_x0:
-                x = x + self.x0_lambdas[i] * x0  # direct skip: token identity anchor
         x = self.ln_f(x)
         # Cast to fp32 for numerically stable cross-entropy (safe under autocast too).
         logits = self.head(x).float()
+        if self.cfg.logit_softcap > 0:
+            logits = self.cfg.logit_softcap * torch.tanh(logits / self.cfg.logit_softcap)
         if targets is None:
             loss = None
         else:
@@ -358,13 +398,18 @@ class GPT(nn.Module):
 
 
 def main():
+    import json, sys
     args = Hyperparameters()
+    if len(sys.argv) > 1:
+        for k, v in json.loads(sys.argv[1]).items():
+            assert hasattr(args, k), f"unknown hyperparam: {k!r}"
+            setattr(args, k, v)
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     # TF32 is NVIDIA-only; no-op on AMD ROCm. Skip to avoid triggering hipBLASLt paths.
 
     # Resolve experiment and run directories
-    exp_dir = expt_util.get_or_create_experiment_dir(args)
+    exp_dir = expt_util.get_or_create_experiment_dir(args, base_dir=args.experiments_dir)
     run_dir = expt_util.create_run_dir(exp_dir, args)
     args.log_file = str(run_dir / "log.txt")
 
@@ -410,8 +455,12 @@ def main():
         use_fa2=args.use_fa2,
         use_rezero=args.use_rezero,
         use_rmsnorm=args.use_rmsnorm,
-        use_x0=args.use_x0,
+        use_token_anchor=args.use_token_anchor,
+        use_resid_scale=args.use_resid_scale,
         weight_init=args.weight_init,
+        tie_weights=args.tie_weights,
+        norm_emb=args.norm_emb,
+        logit_softcap=args.logit_softcap,
         mlp_act=args.mlp_act,
     )
     model = GPT(cfg).to(device)
@@ -432,10 +481,13 @@ def main():
     #   emb_group   : token_emb — large LR, embeddings are slow to converge with small LR
     #   scalar_group: ReZero scalars + x0_lambdas — fast-moving, benefit from high LR
     #   other_group : norms, biases, remaining 1D params — standard LR
-    # head.weight is tied to token_emb.weight, so excluding one excludes both.
+    # head.weight excluded from Muon regardless of tying (output proj → AdamW).
     scalar_ids = set()
     if hasattr(model, 'x0_lambdas'):
         scalar_ids.add(id(model.x0_lambdas))
+    if hasattr(model, 'resid_lambdas'):
+        scalar_ids.add(id(model.resid_lambdas))
+
     for block in model.blocks:
         if hasattr(block, 'attn_scale'):
             scalar_ids.add(id(block.attn_scale))
@@ -457,7 +509,7 @@ def main():
         else:
             other_params.append(p)
 
-    emb_params.append(model.token_emb.weight)  # lm_head tied, only add once
+    emb_params.append(model.token_emb.weight)
 
     adamw_shared = {'kind': 'adamw', 'betas': (0.9, 0.95), 'eps': 1e-8, 'weight_decay': args.adamw_wd}
     compute_dtype = torch.bfloat16 if args.use_bf16 else torch.float32
@@ -469,6 +521,9 @@ def main():
         {**adamw_shared, 'params': scalar_params, 'lr': args.scalar_lr},
         {**adamw_shared, 'params': other_params, 'lr': args.adamw_lr},
     ]
+    if not args.tie_weights:
+        # lm_head is independent — use adamw_lr (output proj, not an embedding)
+        param_groups.append({**adamw_shared, 'params': [model.head.weight], 'lr': args.adamw_lr})
     opt = MuonAdamW(param_groups, compute_dtype=compute_dtype)
 
     # torch.compile: fuses kernels and (with reduce-overhead) captures CUDA graphs.
