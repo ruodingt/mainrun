@@ -24,9 +24,9 @@ class Hyperparameters:
     block_size: int = 64
     batch_size: int = 128
     vocab_size: int = 8192
-    n_layer: int = 6
-    n_q_head: int = 8  # number of query head
-    d_model: int = 512
+    n_layer: int = 12
+    n_q_head: int = 6  # number of query head
+    d_model: int = 384
     dropout: float = 0.1
     muon_lr: float = 0.02  # Muon: 2D weight matrices (attn, mlp)
     adamw_lr: float = 3e-4  # AdamW: norms, biases, other 1D params
