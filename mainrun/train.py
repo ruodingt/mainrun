@@ -28,11 +28,14 @@ class Hyperparameters:
     n_q_head: int = 8  # number of query head
     d_model: int = 512
     dropout: float = 0.1
-    muon_lr: float = 0.02  # Muon: 2D weight matrices (attn, mlp)
-    adamw_lr: float = 3e-4  # AdamW: embeddings, norms, biases
-    adamw_wd: float = 0.1  # weight decay for AdamW group only
+    muon_lr: float = 0.02    # Muon: 2D weight matrices (attn, mlp)
+    adamw_lr: float = 3e-4   # AdamW: norms, biases, other 1D params
+    emb_lr: float = 3e-3     # AdamW: token_emb — sparse updates justify slightly higher LR than base
+    scalar_lr: float = 1e-3  # AdamW: ReZero scalars, x0_lambdas
+    adamw_wd: float = 0.1    # weight decay for AdamW group only
     warmup_frac: float = 0.05  # fraction of total steps for linear warmup
-    min_lr_frac: float = 0.1  # cosine decay floor as fraction of peak lr
+    decay_frac: float = 0.20  # fraction of total steps for final cosine decay (WSD schedule)
+    min_lr_frac: float = 0.0  # cosine decay floor; 0.0 = decay all the way to zero
     evals_per_epoch: int = 3
 
     use_fa2: bool = True
@@ -417,27 +420,46 @@ def main():
     # accumulations and softmax in fp32.
     amp_dtype = torch.bfloat16 if args.use_bf16 else None  # None = no autocast
 
-    # MuonAdamW: Muon for 2D weight matrices, AdamW for embeddings/norms/biases.
-    # Muon should not be used for embedding or head layers (see optim.py docstring).
+    # MuonAdamW: Muon for 2D weight matrices, AdamW split into three groups by LR:
+    #   emb_group   : token_emb — large LR, embeddings are slow to converge with small LR
+    #   scalar_group: ReZero scalars + x0_lambdas — fast-moving, benefit from high LR
+    #   other_group : norms, biases, remaining 1D params — standard LR
     # head.weight is tied to token_emb.weight, so excluding one excludes both.
+    scalar_ids = set()
+    if hasattr(model, 'x0_lambdas'):
+        scalar_ids.add(id(model.x0_lambdas))
+    for block in model.blocks:
+        if hasattr(block, 'attn_scale'):
+            scalar_ids.add(id(block.attn_scale))
+            scalar_ids.add(id(block.mlp_scale))
+
     skip_ids = {id(model.token_emb.weight), id(model.head.weight)}
     muon_groups: dict[tuple, list] = {}
-    adamw_params: list = []
+    emb_params, scalar_params, other_params = [], [], []
+
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if id(p) in skip_ids or p.ndim < 2:
-            adamw_params.append(p)
-        else:
+        if id(p) in skip_ids:
+            continue  # handled separately below
+        if p.ndim >= 2:
             muon_groups.setdefault(tuple(p.shape), []).append(p)
+        elif id(p) in scalar_ids:
+            scalar_params.append(p)
+        else:
+            other_params.append(p)
 
+    emb_params.append(model.token_emb.weight)  # lm_head tied, only add once
+
+    adamw_shared = {'kind': 'adamw', 'betas': (0.9, 0.95), 'eps': 1e-8, 'weight_decay': args.adamw_wd}
     compute_dtype = torch.bfloat16 if args.use_bf16 else torch.float32
     param_groups = [
         *[{'kind': 'muon', 'params': ps, 'lr': args.muon_lr,
            'momentum': 0.95, 'ns_steps': 5, 'beta2': 0.999, 'weight_decay': 0.0}
           for ps in muon_groups.values()],
-        {'kind': 'adamw', 'params': adamw_params, 'lr': args.adamw_lr,
-         'betas': (0.9, 0.95), 'eps': 1e-8, 'weight_decay': args.adamw_wd},
+        {**adamw_shared, 'params': emb_params,    'lr': args.emb_lr},
+        {**adamw_shared, 'params': scalar_params,  'lr': args.scalar_lr},
+        {**adamw_shared, 'params': other_params,   'lr': args.adamw_lr},
     ]
     opt = MuonAdamW(param_groups, compute_dtype=compute_dtype)
 
@@ -447,13 +469,17 @@ def main():
     if args.use_compile and device != "cpu":
         model = torch.compile(model, mode="reduce-overhead")
 
-    # Linear warmup then cosine decay to min_lr_frac * peak_lr.
+    # WSD schedule: warmup → stable (full LR) → cosine decay to min_lr_frac.
     warmup_steps = int(max_steps * args.warmup_frac)
+    decay_steps  = int(max_steps * args.decay_frac)
+    stable_steps = max_steps - warmup_steps - decay_steps
 
     def lr_lambda(step):
         if step < warmup_steps:
             return step / max(warmup_steps, 1)
-        progress = (step - warmup_steps) / max(max_steps - warmup_steps, 1)
+        if step < warmup_steps + stable_steps:
+            return 1.0
+        progress = (step - warmup_steps - stable_steps) / max(decay_steps, 1)
         return args.min_lr_frac + (1 - args.min_lr_frac) * 0.5 * (1 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
@@ -521,8 +547,10 @@ def main():
 
             if tb_writer:
                 tb_writer.add_scalar("Loss/train", loss.item(), step)
-                tb_writer.add_scalar("Charts/muon_lr", opt.param_groups[0]['lr'], step)
-                tb_writer.add_scalar("Charts/adamw_lr", opt.param_groups[-1]['lr'], step)
+                tb_writer.add_scalar("Charts/muon_lr",   opt.param_groups[0]['lr'], step)
+                tb_writer.add_scalar("Charts/emb_lr",    opt.param_groups[-3]['lr'], step)
+                tb_writer.add_scalar("Charts/scalar_lr", opt.param_groups[-2]['lr'], step)
+                tb_writer.add_scalar("Charts/adamw_lr",  opt.param_groups[-1]['lr'], step)
                 tb_writer.add_scalar("Throughput/local_tokens_per_sec", local_tokens_per_sec, step)
                 tb_writer.add_scalar("Throughput/avg_tokens_per_sec", avg_tokens_per_sec, step)
                 tb_writer.add_scalar("Bottleneck/data_ms", data_time * 1000, step)
