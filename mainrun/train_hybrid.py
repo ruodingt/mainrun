@@ -7,18 +7,15 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-import torch.nn as nn
 from datasets import load_dataset
 from torch.nn import functional as F
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 import expt_util
-from kernels.fused_ce_v2 import fused_linear_ce_v2
-from kernels.rms_norm import TritonRMSNorm
 from optim import MuonAdamW
-from rope import apply_rotary_emb, RotaryEmbedding
 from tokenizer import BPETokenizer, train_tokenizer
+from train import GPT, GPTConfig
 
 
 @dataclass
@@ -50,6 +47,16 @@ class Hyperparameters:
     logit_softcap: float = 15.0       # tanh softcap on logits; 0.0 = disabled
     n_kv_heads: int = 1  # n_kv_heads can be 1, 2, 4 to enable MQA
     mlp_act: str = "relu_sq"  # gelu
+
+    # Hybrid Mamba/Attention (only used when layer_pattern contains 'M')
+    # "AAAAAAAAAAAA" = pure Transformer; "MMMAMMMAMMMA" = Jamba-ish; "MAMAMAMAMAMA" = Samba-style
+    layer_pattern: str = "A" * 12
+    expand: int = 2      # Mamba d_inner = expand * d_model
+    d_head: int = 64     # Mamba SSM per-head dim
+    d_state: int = 128   # Mamba SSM state dim
+    n_groups: int = 1    # SSD groups (B/C shared across heads per group)
+    d_conv: int = 4      # Mamba depthwise conv kernel size
+    chunk_len: int = 64  # SSD chunk length; must divide block_size
 
     # irrelevant/minor to training / loss
     use_fa2: bool = True
@@ -137,279 +144,6 @@ def iter_full_split(split_ids: torch.Tensor, block_size: int, batch_size: int, d
         yield x, y
 
 
-@dataclass
-class GPTConfig:
-    vocab_size: int
-    block_size: int
-    n_layer: int
-    n_q_head: int
-    d_model: int
-    dropout: float
-    # Explicit control for MQA/GQA; defaults to n_q_head (standard MHA mode)
-    n_kv_heads: int = 8
-    use_rezero: bool = True
-    use_rmsnorm: bool = True
-    use_token_anchor: bool = True
-    use_resid_scale: bool = True
-    weight_init: str = "gpt2"
-    tie_weights: bool = True
-    norm_emb: bool = False
-    logit_softcap: float = 15.0
-    mlp_act: str = "relu_sq"
-    # Enable SDPA (FlashAttention-2) by default to leverage hardware-level acceleration on RDNA 3.5 UMA
-    use_fa2: bool = True
-    use_fused_ce: bool = False
-
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, cfg: GPTConfig):
-        super().__init__()
-        assert cfg.d_model % cfg.n_q_head == 0
-        self.n_q_head = cfg.n_q_head
-        self.head_dim = cfg.d_model // cfg.n_q_head
-
-        # Dynamic support: n_kv_heads = n_q_head (MHA), n_kv_heads = 1 (MQA), 1 < n_kv_heads < n_q_head (GQA)
-        self.n_kv_heads = getattr(cfg, "n_kv_heads", cfg.n_q_head)
-        self.use_sdpa = getattr(cfg, "use_fa2", True)  # Static switch for SDPA
-        self.dropout_p = cfg.dropout
-
-        # [Muon Overclocking Core Design: Decoupled Projections]
-        # Isolate q_proj so its shape strictly equals (d_model, d_model) -> e.g., 512x512.
-        # This allows q_proj to be perfectly stacked with the final proj (512x512) into a single Muon optimizer group!
-        self.q_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
-
-        # kv_proj handles variable KV heads. Under MQA, its shape is only (d_model, 2 * head_dim) -> e.g., 512x128.
-        # Since this matrix is very small, it can be assigned to the AdamW group or a separate Muon group,
-        # preserving the stack structure of the main Muon group.
-        self.kv_proj = nn.Linear(cfg.d_model, 2 * self.n_kv_heads * self.head_dim, bias=False)
-
-        # Output projection layer: Shape strictly equals (d_model, d_model) -> perfectly aligned with q_proj.
-        self.proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
-
-        self.attn_drop = nn.Dropout(cfg.dropout)
-        self.resid_drop = nn.Dropout(cfg.dropout)
-
-        # Prevent state contamination: register tril buffer only in manual debugging mode.
-        if not self.use_sdpa:
-            tril = torch.tril(torch.ones(cfg.block_size, cfg.block_size, dtype=torch.bool))
-            self.register_buffer("tril", tril, persistent=False)
-
-    def forward(self, x: torch.Tensor, cos_sin) -> torch.Tensor:
-        B, T, C = x.size()
-
-        # 1. Project Q and KV
-        # q shape: (B, T, n_q_head, head_dim) -> transpose to (B, n_q_head, T, head_dim)
-        q = self.q_proj(x).view(B, T, self.n_q_head, self.head_dim).transpose(1, 2)
-
-        # kv shape: (B, T, 2, n_kv_heads, head_dim) -> transpose to (B, n_kv_heads, T, head_dim)
-        kv = self.kv_proj(x).view(B, T, 2, self.n_kv_heads, self.head_dim).transpose(1, 3)
-        k, v = kv[..., 0, :, :], kv[..., 1, :, :]
-
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-
-        # 2. Static conditional routing
-        if self.use_sdpa:
-            # PyTorch SDPA natively supports GQA/MQA broadcasting (when n_q_head % n_kv_heads == 0).
-            # Automatically activates hardware-level Causal FlashAttention acceleration under the hood (e.g., RDNA 3.5).
-            y = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,
-                dropout_p=self.dropout_p if self.training else 0.0,
-                is_causal=True,
-            )
-        else:
-            # Backup/debug path manually supporting GQA/MQA broadcasting.
-            if self.n_q_head != self.n_kv_heads:
-                # Broadcast along the head dimension to align with Q's head count.
-                num_queries_per_kv = self.n_q_head // self.n_kv_heads
-                k = k.repeat_interleave(num_queries_per_kv, dim=1)
-                v = v.repeat_interleave(num_queries_per_kv, dim=1)
-
-            # Classic white-box dot-product attention calculation.
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
-            att = att.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_drop(att)
-            y = att @ v
-
-        # 3. Restore dimensions and apply output projection
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.resid_drop(self.proj(y))
-
-
-def _make_norm(d_model: int, use_rmsnorm: bool) -> nn.Module:
-    # RMSNorm normalizes by root-mean-square only — no mean-centering, no bias term.
-    # Tradeoff vs LayerNorm:
-    #   + ~15% faster (skips mean subtraction and bias addition)
-    #   + fewer parameters: saves d_model params per norm (no bias vector)
-    #   + empirically matches or beats LayerNorm in practice (LLaMA, Mistral, Gemma all use it)
-    #   - loses the re-centering property; can't shift the output distribution, only scale it
-    #   - slightly less expressive in theory, though this rarely matters at this scale
-    if use_rmsnorm:
-        return TritonRMSNorm(d_model)
-    return nn.LayerNorm(d_model)
-
-
-class ReLUSquared(nn.Module):
-    def forward(self, x):
-        return torch.relu(x).square()
-
-
-class MLP(nn.Module):
-    def __init__(self, cfg: GPTConfig):
-        super().__init__()
-
-        _actv = {
-            'relu_sq': ReLUSquared(),
-            'gelu': nn.GELU(),
-        }
-
-        #  torch.compile -> kernel fusion。
-        self.net = nn.Sequential(
-            nn.Linear(cfg.d_model, 4 * cfg.d_model),
-            _actv[cfg.mlp_act],
-            nn.Linear(4 * cfg.d_model, cfg.d_model),
-            nn.Dropout(cfg.dropout),
-        )
-
-    def forward(self, x): return self.net(x)
-
-
-class Block(nn.Module):
-    def __init__(self, cfg: GPTConfig):
-        super().__init__()
-        self.ln1 = _make_norm(cfg.d_model, cfg.use_rmsnorm)
-        self.ln2 = _make_norm(cfg.d_model, cfg.use_rmsnorm)
-        self.attn = CausalSelfAttention(cfg)
-        self.mlp = MLP(cfg)
-        self.use_rezero = cfg.use_rezero
-        if self.use_rezero:
-            self.attn_scale = nn.Parameter(torch.zeros(1))
-            self.mlp_scale = nn.Parameter(torch.zeros(1))
-
-    def forward(self, x, cos_sin):
-        if self.use_rezero:
-            x = x + self.attn_scale * self.attn(self.ln1(x), cos_sin)
-            x = x + self.mlp_scale * self.mlp(self.ln2(x))
-        else:
-            x = x + self.attn(self.ln1(x), cos_sin)
-            x = x + self.mlp(self.ln2(x))
-        return x
-
-
-class GPT(nn.Module):
-    def __init__(self, cfg: GPTConfig):
-        super().__init__()
-        self.cfg = cfg
-        self.token_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.drop = nn.Dropout(cfg.dropout)
-
-        head_dim = cfg.d_model // cfg.n_q_head
-        self.rope = RotaryEmbedding(head_dim, max_seq_len=cfg.block_size)
-        self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
-        self.ln_f = _make_norm(cfg.d_model, cfg.use_rmsnorm)
-        self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
-
-        if cfg.use_token_anchor:
-            # nanochat-style: before each block, scale residual + inject original embedding.
-            # x0_lambdas: decaying blend of original token embedding (0.20→0.05).
-            self.x0_lambdas = nn.Parameter(torch.linspace(0.20, 0.05, cfg.n_layer))
-        if cfg.use_resid_scale:
-            # resid_lambdas: slight amplification (1.15→1.05) biases toward preserving info.
-            # Applied before each block together with x0 (requires use_token_anchor=True).
-            assert cfg.use_token_anchor, "use_resid_scale requires use_token_anchor=True"
-            self.resid_lambdas = nn.Parameter(torch.linspace(1.15, 1.05, cfg.n_layer))
-
-        self._init_weights()
-        if cfg.tie_weights:
-            self.head.weight = self.token_emb.weight
-
-    def _init_weights(self):
-        _plans = {
-            "gpt2": self._init_gpt2,
-            "muon_uniform": self._init_muon_uniform,
-        }
-        assert self.cfg.weight_init in _plans, f"unknown weight_init: {self.cfg.weight_init!r}"
-        _plans[self.cfg.weight_init]()
-
-    def _init_gpt2(self):
-        # GPT-2 style: Normal(0, 0.02) for all weights.
-        # Norms keep default init (weight=1, bias=0).
-        # See docs/decisions/001-weight-init.md.
-        nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
-        if not self.cfg.tie_weights:
-            nn.init.normal_(self.head.weight, mean=0.0, std=0.02)
-        for block in self.blocks:
-            nn.init.normal_(block.attn.q_proj.weight, mean=0.0, std=0.02)
-            nn.init.normal_(block.attn.kv_proj.weight, mean=0.0, std=0.02)
-            nn.init.normal_(block.attn.proj.weight, mean=0.0, std=0.02)
-            nn.init.normal_(block.mlp.net[0].weight, mean=0.0, std=0.02)
-            nn.init.normal_(block.mlp.net[2].weight, mean=0.0, std=0.02)
-
-    @torch.no_grad()
-    def _init_muon_uniform(self):
-        # Muon-aware init: Uniform + fan-in scaling + zero residual exits.
-        # Every parameter is set explicitly — no hidden base-pass overrides.
-        # Norms (RMSNorm/LayerNorm) keep their default init (weight=1, bias=0).
-        # See docs/decisions/001-weight-init.md for full tradeoff analysis.
-
-        # token_emb: std=0.02 (safe with tied lm_head).
-        # For std=0.8 (nanochat style), use tie_weights=False + norm_emb=True together.
-        nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
-        if not self.cfg.tie_weights:
-            nn.init.normal_(self.head.weight, mean=0.0, std=0.001)
-
-        for block in self.blocks:
-            d = block.attn.q_proj.weight.shape[1]  # fan_in = d_model
-            s = 3 ** 0.5 * d ** -0.5  # uniform bound s.t. std = 1/sqrt(fan_in)
-
-            # Uniform[-s, s]: same std as Normal(0, 1/sqrt(fan_in)) but no tails.
-            # Flatter singular value spectrum → cleaner Polar Express orthogonalization.
-            nn.init.uniform_(block.attn.q_proj.weight, -s, s)
-            nn.init.uniform_(block.attn.kv_proj.weight, -s, s)
-
-            # Residual exits → zero: each Block is identity at step 0.
-            # Muon grows these from zero via orthogonalized gradient direction.
-            nn.init.zeros_(block.attn.proj.weight)
-
-            # MLP up: 0.4x scale compensates 4x dim expansion (d_model → 4*d_model).
-            # MLP down: zero exit, same reasoning as attn.proj.
-            nn.init.uniform_(block.mlp.net[0].weight, -s * 0.4, s * 0.4)
-            nn.init.zeros_(block.mlp.net[2].weight)
-
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        B, T = idx.size()
-        x0 = self.drop(self.token_emb(idx))
-        if self.cfg.norm_emb:
-            x0 = self.ln_f(x0)  # normalize embedding before use as anchor (nanochat style)
-        x = x0
-        cos_sin = self.rope(x, T)
-        for i, block in enumerate(self.blocks):
-            if self.cfg.use_token_anchor:
-                r = self.resid_lambdas[i] if self.cfg.use_resid_scale else 1.0
-                x = r * x + self.x0_lambdas[i] * x0
-            x = block(x, cos_sin)
-        x = self.ln_f(x)
-        # Fused path: training only (grad enabled), skips materialising [BT, V] logits.
-        # Falls back to standard path for eval (no_grad) since evaluate() needs logits.
-        if self.cfg.use_fused_ce and targets is not None and torch.is_grad_enabled():
-            x_flat = x.view(-1, x.size(-1))
-            loss   = fused_linear_ce_v2(x_flat, self.head.weight, targets.view(-1),
-                                        logit_softcap=self.cfg.logit_softcap)
-            return None, loss
-
-        # Standard path (eval + use_fused_ce=False).
-        logits = self.head(x).float()
-        if self.cfg.logit_softcap > 0:
-            logits = self.cfg.logit_softcap * torch.tanh(logits / self.cfg.logit_softcap)
-        if targets is None:
-            loss = None
-        else:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction='mean')
-        return logits, loss
-
-
 def main():
     import json, sys
     args = Hyperparameters()
@@ -477,7 +211,33 @@ def main():
         mlp_act=args.mlp_act,
         use_fused_ce=args.use_fused_ce,
     )
-    model = GPT(cfg).to(device)
+    if 'M' in args.layer_pattern:
+        from hybrid import HybridLM, HybridConfig
+        hybrid_cfg = HybridConfig(
+            vocab_size=tok.vocab_size,
+            block_size=args.block_size,
+            d_model=args.d_model,
+            layer_pattern=args.layer_pattern,
+            dropout=args.dropout,
+            n_q_head=args.n_q_head,
+            n_kv_heads=args.n_kv_heads,
+            use_fa2=args.use_fa2,
+            expand=args.expand,
+            d_head=args.d_head,
+            d_state=args.d_state,
+            n_groups=args.n_groups,
+            d_conv=args.d_conv,
+            chunk_len=args.chunk_len,
+            use_rmsnorm=args.use_rmsnorm,
+            use_rezero=args.use_rezero,
+            tie_weights=args.tie_weights,
+            norm_emb=args.norm_emb,
+            logit_softcap=args.logit_softcap,
+            mlp_act=args.mlp_act,
+        )
+        model = HybridLM(hybrid_cfg).to(device)
+    else:
+        model = GPT(cfg).to(device)
     model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.log("model_info", parameters_count=model_params)
 
@@ -517,17 +277,13 @@ def main():
         if id(p) in skip_ids:
             continue  # handled separately below
         if p.ndim >= 2:
-            # Muon orthogonalizes 2D weight matrices only. The current GPT has none
-            # other than 2D matrices, so this is a no-op guard today.
-            # TODO(hybrid/mamba): Mamba's depthwise conv1d.weight is 3D — it must NOT
-            # land in Muon (orthogonalizing a depthwise kernel diverges training).
-            # When wiring Mamba/HybridLM into this loop, route conv weights to AdamW
-            # (other_params), and SSM scalars A_log/D/dt_bias (1D) + ReZero scales here too.
-            assert p.ndim == 2, (
-                f"Muon group expects 2D matrices, got {name!r} with ndim={p.ndim}. "
-                f"Route this param to an AdamW group (see TODO above)."
-            )
-            muon_groups.setdefault(tuple(p.shape), []).append(p)
+            if p.ndim == 2:
+                # Muon handles square-ish 2D weight matrices (attn projections, MLP weights, Mamba in/out proj).
+                muon_groups.setdefault(tuple(p.shape), []).append(p)
+            else:
+                # 3D+ params (e.g. Mamba conv1d.weight shape [d_inner, 1, d_conv]):
+                # orthogonalizing a depthwise conv kernel is undefined/harmful → AdamW.
+                other_params.append(p)
         elif id(p) in scalar_ids:
             scalar_params.append(p)
         else:

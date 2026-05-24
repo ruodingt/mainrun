@@ -267,9 +267,15 @@ class MuonAdamW(torch.optim.Optimizer):
         second_momentum_buffer = state["second_momentum_buffer"]
         red_dim = -1 if shape[-2] >= shape[-1] else -2
 
-        # Stack grads and params (NOTE: this assumes all params have the same shape)
-        stacked_grads = torch.stack([p.grad for p in params])
-        stacked_params = torch.stack(params)
+        # Pre-allocated stacked buffers — reused every step to avoid per-step CUDA allocation.
+        if "grad_buffer" not in state:
+            state["grad_buffer"]   = torch.empty(num_params, *shape, dtype=dtype, device=device)
+            state["params_buffer"] = torch.empty(num_params, *shape, dtype=dtype, device=device)
+        stacked_grads  = state["grad_buffer"]
+        stacked_params = state["params_buffer"]
+        for i, p in enumerate(params):
+            stacked_grads[i].copy_(p.grad)
+            stacked_params[i].copy_(p)
 
         # Fill all the 0-D tensors with current values
         self._muon_momentum_t.fill_(group["momentum"])
