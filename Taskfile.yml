@@ -17,6 +17,11 @@ tasks:
     cmds:
       - python3 train.py
 
+  train_nohup:
+    dir: mainrun
+    cmds:
+      - nohup python3 train.py sweep > train.log 2>train.err &
+
   submit:
     deps: [checkpoint]
     dir: scripts

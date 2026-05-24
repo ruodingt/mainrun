@@ -71,7 +71,7 @@ matmul is written into the Triton kernel, the [BT, V] logits tensor does not exi
 
 #### Algorithm
 ```
-pass 1: scan V, tl.dot compute logits tile → online softmax (m, s) + collect target logit
+pass 1: scan V, tl.dot compute logits tile → online softmax (m_new = max(m, m_tile), s_new = s*exp(m-m_new) + sum(exp(x-m_new))) + collect target logit
 pass 2: recompute logits tile → softmax → grad_logits → grad_x (local) + grad_W (atomic_add)
 ```
 
@@ -95,8 +95,9 @@ autotune selected `BLOCK_M=16, BLOCK_V=16, num_warps=4, num_stages=1`.
 
 #### Why is it still slower than standard?
 - Standard fwd+bwd = 3 large GEMMs (logits, grad_x, grad_W)
-- v2 = 4 (logits computed twice) + 512 programs competing with atomic_add
-- gfx1151 is a gaming GPU, WMMA is an added feature; V=8192 is not a memory bottleneck
+- v2 = 3 full GEMMs + 1 cache-hot partial GEMM (pass 2 "recomputes logits" but only reads x and W without writing out the full [BT, V] tensor).
+- If v2 is 313ms vs 198ms (1.58x), the gap to the theoretical ~1.33x is likely RDNA WMMA utilization limits rather than pure instruction counts. (maybe?)
+- **atomic_add vs occupancy**: We previously suspected 512 programs competing on `atomic_add` was the bottleneck. However, atomic conflicts are cache-line based, not program based. It is highly probable that the 256 VGPR requirement for the `grad_x` accumulator is crushing occupancy down to 1, acting as the true bottleneck.
 
 #### 3-kernel design (abandoned after discussion)
 Proposal: Kernel1 (loss) + Kernel2 (grad_x) + Kernel3 (grad_W) to eliminate atomic.
@@ -113,7 +114,8 @@ Primary value is in **Memory** (4.21x), speed-wise gfx1151 doesn't have an advan
 | Operation | File | Description |
 |---|---|---|
 | Uncomment CDNA3 configs | `kernels/fused_ce_v2.py` L17-21 | BLOCK_V=64/128, num_stages=2 |
-| Remove bf16 cast | `kernels/fused_ce_v2.py` | MFMA supports fp32 dot, better precision |
+| Remove bf16 cast | `kernels/fused_ce_v2.py` | MFMA supports fp32 dot, but throughput is often 1/4 to 1/2 of bf16/fp16. **Recommendation:** Keep both configs and let autotune decide. |
+| Re-evaluate RMSNorm baseline | `kernels/rms_norm.py` | CDNA3 PyTorch baseline (via hipBLASLt/CK) will be much stronger. The current 4x speedup may drop to 1.5-2x. |
 | Evaluate RoPE Triton | `rope.py` | HBM3 bandwidth 18x, might turn the tables at large T |
 | Rerun autotune | All kernels | Run automatic search on new hardware for the first time |
 
@@ -129,3 +131,10 @@ Primary value is in **Memory** (4.21x), speed-wise gfx1151 doesn't have an advan
 | RoPE bwd | None (exact, same kernel) | 0.00 |
 | Fused CE fwd | bf16 matmul vs fp32 ref | ~5e-3 |
 | Fused CE bwd dx/dW | bf16 accumulation order across tiles | ~2e-3 |
+
+---
+
+## 6. TODOs / Next Steps
+
+- **Fused CE "Tokens/Sec at same budget" test**: Run an experiment measuring actual throughput. If the 4.2x memory savings allows us to increase batch size and ultimately wins on `tokens/sec`, flip `use_fused_ce` default to `True`.
+- **Profile Fused CE on gfx1151**: Run `rocprof` to check the `SQ_INSTS_VALU` vs `SQ_INSTS_LDS` ratio to definitively confirm if the bottleneck is `atomic_add` conflicts or VGPR-induced low occupancy.

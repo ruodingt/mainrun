@@ -37,7 +37,7 @@ class Hyperparameters:
     adamw_wd: float = 0.1  # weight decay for AdamW group only
     lr_schedule: str = "wsd"  # "wsd" (warmup→stable→decay) | "cosine" (warmup→cosine decay)
     warmup_frac: float = 0.05  # fraction of total steps for linear warmup
-    decay_frac: float = 0.30  # WSD only: fraction of total steps for final cosine decay
+    decay_frac: float = 0.50  # WSD only: fraction of total steps for final cosine decay
     min_lr_frac: float = 0.0  # decay floor; 0.0 = decay all the way to zero
 
     use_rezero: bool = False  # learnable per-layer residual scalars (ReZero); init=0 → identity at step 0
