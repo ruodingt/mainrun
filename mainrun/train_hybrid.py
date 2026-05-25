@@ -15,7 +15,7 @@ import expt_util
 from hparams import Hyperparameters
 from optim import MuonAdamW
 from tokenizer import BPETokenizer, train_tokenizer
-from train import GPT, GPTConfig
+from hybrid import HybridLM
 
 import contextlib
 
@@ -121,54 +121,9 @@ def main():
                vocab_size=tok.vocab_size)
 
     print("vocab:", tok.vocab_size)
+    args.arch.vocab_size = tok.vocab_size  # sync actual vocab size back (tokenizer may round)
 
-    cfg = GPTConfig(
-        vocab_size=tok.vocab_size,
-        block_size=args.train.block_size,
-        n_layer=args.arch.n_layer,
-        n_q_head=args.attention.n_q_head,
-        n_kv_heads=args.attention.n_kv_heads,
-        d_model=args.arch.d_model,
-        dropout=args.arch.dropout,
-        use_fa2=args.runtime.use_fa2,
-        use_rezero=args.arch.use_rezero,
-        use_rmsnorm=args.arch.use_rmsnorm,
-        use_token_anchor=args.arch.use_token_anchor,
-        use_resid_scale=args.arch.use_resid_scale,
-        weight_init=args.arch.weight_init,
-        tie_weights=args.arch.tie_weights,
-        norm_emb=args.arch.norm_emb,
-        logit_softcap=args.arch.logit_softcap,
-        mlp_act=args.arch.mlp_act,
-        use_fused_ce=args.runtime.use_fused_ce,
-    )
-    if 'M' in args.arch.layer_pattern:
-        from hybrid import HybridLM, HybridConfig
-        hybrid_cfg = HybridConfig(
-            vocab_size=tok.vocab_size,
-            block_size=args.train.block_size,
-            d_model=args.arch.d_model,
-            layer_pattern=args.arch.layer_pattern,
-            dropout=args.arch.dropout,
-            n_q_head=args.attention.n_q_head,
-            n_kv_heads=args.attention.n_kv_heads,
-            use_fa2=args.runtime.use_fa2,
-            expand=args.mamba.expand,
-            d_head=args.mamba.d_head,
-            d_state=args.mamba.d_state,
-            n_groups=args.mamba.n_groups,
-            d_conv=args.mamba.d_conv,
-            chunk_len=args.mamba.chunk_len,
-            use_rmsnorm=args.arch.use_rmsnorm,
-            use_rezero=args.arch.use_rezero,
-            tie_weights=args.arch.tie_weights,
-            norm_emb=args.arch.norm_emb,
-            logit_softcap=args.arch.logit_softcap,
-            mlp_act=args.arch.mlp_act,
-        )
-        model = HybridLM(hybrid_cfg).to(device)
-    else:
-        model = GPT(cfg).to(device)
+    model = HybridLM(args, tok.vocab_size).to(device)
     model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.log("model_info", parameters_count=model_params)
 
@@ -178,55 +133,39 @@ def main():
 
     # MuonAdamW: Muon for 2D weight matrices, AdamW split into three groups by LR:
     #   emb_group   : token_emb — large LR, embeddings are slow to converge with small LR
-    #   scalar_group: ReZero scalars + x0_lambdas — fast-moving, benefit from high LR
-    #   other_group : norms, biases, remaining 1D params — standard LR
-    # head.weight excluded from Muon regardless of tying (output proj → AdamW).
-    scalar_ids = set()
-    if hasattr(model, 'x0_lambdas'):
-        scalar_ids.add(id(model.x0_lambdas))
-    if hasattr(model, 'resid_lambdas'):
-        scalar_ids.add(id(model.resid_lambdas))
-    for block in model.blocks:
-        # GPT Block uses attn_scale; HybridBlock uses mixer_scale
-        scale_attr = 'attn_scale' if hasattr(block, 'attn_scale') else 'mixer_scale'
-        if hasattr(block, scale_attr):
-            scalar_ids.add(id(getattr(block, scale_attr)))
-            scalar_ids.add(id(block.mlp_scale))
+    #   scalar_group: rezero scales + x0_lambdas — fast-moving, benefit from high LR
+    #   other_group : norms, biases, remaining 1D/3D params — standard LR
+    _SCALAR_NAMES = ('x0_lambdas', 'resid_lambdas', 'mixer_scale', 'mlp_scale', 'attn_scale')
 
-    skip_ids = {id(model.token_emb.weight), id(model.head.weight)}
     muon_groups: dict[tuple, list] = {}
     emb_params, scalar_params, other_params = [], [], []
 
+    seen_ids: set[int] = set()  # dedup tied weights (token_emb.weight == head.weight when tied)
     for name, p in model.named_parameters():
-        if not p.requires_grad:
+        if not p.requires_grad or id(p) in seen_ids:
             continue
-        if id(p) in skip_ids:
-            continue
-        if p.ndim >= 2:
-            if p.ndim == 2:
-                muon_groups.setdefault(tuple(p.shape), []).append(p)
-            else:
-                # 3D+ params (e.g. Mamba conv1d.weight): orthogonalization undefined → AdamW.
-                other_params.append(p)
-        elif id(p) in scalar_ids:
+        seen_ids.add(id(p))
+        if any(k in name for k in _SCALAR_NAMES):  # rezero scales, token anchor lambdas
             scalar_params.append(p)
+        elif 'token_emb' in name:                   # sparse updates → own high-LR group
+            emb_params.append(p)
+        elif p.ndim == 2 and 'conv' not in name and 'head' not in name:
+            muon_groups.setdefault(tuple(p.shape), []).append(p)
         else:
+            # 1D (norms, biases), 3D conv (Muon ortho degenerates on (d,1,k)), head.weight
             other_params.append(p)
-
-    emb_params.append(model.token_emb.weight)
 
     adamw_shared = {'kind': 'adamw', 'betas': (0.9, 0.95), 'eps': 1e-8, 'weight_decay': args.optimizer.adamw_wd}
     compute_dtype = torch.bfloat16 if args.runtime.use_bf16 else torch.float32
+    pg_emb    = {**adamw_shared, 'params': emb_params,    'lr': args.optimizer.emb_lr}
+    pg_scalar = {**adamw_shared, 'params': scalar_params, 'lr': args.optimizer.scalar_lr}
+    pg_other  = {**adamw_shared, 'params': other_params,  'lr': args.optimizer.adamw_lr}
     param_groups = [
         *[{'kind': 'muon', 'params': ps, 'lr': args.optimizer.muon_lr,
            'momentum': 0.95, 'ns_steps': 5, 'beta2': 0.999, 'weight_decay': 0.0}
           for ps in muon_groups.values()],
-        {**adamw_shared, 'params': emb_params,    'lr': args.optimizer.emb_lr},
-        {**adamw_shared, 'params': scalar_params, 'lr': args.optimizer.scalar_lr},
-        {**adamw_shared, 'params': other_params,  'lr': args.optimizer.adamw_lr},
+        pg_emb, pg_scalar, pg_other,
     ]
-    if not args.arch.tie_weights:
-        param_groups.append({**adamw_shared, 'params': [model.head.weight], 'lr': args.optimizer.adamw_lr})
     opt = MuonAdamW(param_groups, compute_dtype=compute_dtype)
 
     # torch.compile must happen AFTER param groups are collected (optimizer holds refs to original params).
@@ -323,9 +262,9 @@ def main():
             if tb_writer:
                 tb_writer.add_scalar("Loss/train", loss.item(), step)
                 tb_writer.add_scalar("Charts/muon_lr", opt.param_groups[0]['lr'], step)
-                tb_writer.add_scalar("Charts/emb_lr", opt.param_groups[-3]['lr'], step)
-                tb_writer.add_scalar("Charts/scalar_lr", opt.param_groups[-2]['lr'], step)
-                tb_writer.add_scalar("Charts/adamw_lr", opt.param_groups[-1]['lr'], step)
+                tb_writer.add_scalar("Charts/emb_lr", pg_emb['lr'], step)
+                tb_writer.add_scalar("Charts/scalar_lr", pg_scalar['lr'], step)
+                tb_writer.add_scalar("Charts/adamw_lr", pg_other['lr'], step)
                 tb_writer.add_scalar("Throughput/local_tokens_per_sec", local_tokens_per_sec, step)
                 tb_writer.add_scalar("Throughput/avg_tokens_per_sec", avg_tokens_per_sec, step)
                 tb_writer.add_scalar("Bottleneck/data_ms", data_time * 1000, step)

@@ -12,62 +12,19 @@ Why a pure-PyTorch SSD scan instead of the official `mamba_ssm` CUDA kernels:
     sequence of matmuls + a segment-sum, which is exactly what torch.compile /
     Inductor fuses well. At block_size=64 the chunked scan is cheap.
 
-Design parity with train.py's GPT:
-  - same forward signature: forward(idx, targets=None) -> (logits, loss)
-  - MambaConfig mirrors GPTConfig field names where they overlap (vocab_size,
-    block_size, n_layer, d_model, dropout, tie_weights, logit_softcap, norm_emb,
-    use_rmsnorm) so this model is a drop-in swap.
-  - No positional encoding: the causal depthwise conv + the recurrence carry
-    order information. This is a structural advantage over attention — one fewer
-    moving part, and it generalizes past block_size for free.
+Mamba2Mixer is a drop-in token mixer for HybridLM. It accepts a duck-typed cfg
+namespace with fields: d_model, d_inner, n_heads, d_head, d_state, n_groups,
+d_conv, chunk_len, conv_bias, proj_bias, dropout, norm.
 """
 
 import math
-from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-@dataclass
-class MambaConfig:
-    vocab_size: int
-    block_size: int
-    n_layer: int
-    d_model: int
-    dropout: float = 0.0
 
-    # --- SSM core dimensions ---
-    expand: int = 2          # inner width = expand * d_model (the SSM operates here)
-    d_head: int = 64         # per-head channel dim P; n_heads = d_inner // d_head
-    d_state: int = 128       # SSM state dim N (size of the latent recurrent state)
-    n_groups: int = 1        # B/C are shared across heads within a group (GVA-style)
-    d_conv: int = 4          # causal depthwise conv kernel width (short-range mixing)
-    chunk_len: int = 64      # SSD chunk size; must divide block_size. ==block_size -> single chunk
-
-    conv_bias: bool = True
-    proj_bias: bool = False
-
-    # --- shared with GPT for training-loop / optimizer parity ---
-    use_rmsnorm: bool = True
-    tie_weights: bool = True
-    norm_emb: bool = False
-    logit_softcap: float = 15.0
-    weight_init: str = "mamba"  # "mamba" (canonical) — zeros out_proj for identity-start blocks
-
-    @property
-    def d_inner(self) -> int:
-        return self.expand * self.d_model
-
-    @property
-    def n_heads(self) -> int:
-        assert self.d_inner % self.d_head == 0, "d_inner must be divisible by d_head"
-        return self.d_inner // self.d_head
-
-
-def _make_norm(d: int, use_rmsnorm: bool) -> nn.Module:
-    return nn.RMSNorm(d) if use_rmsnorm else nn.LayerNorm(d)
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +134,7 @@ class RMSNormGated(nn.Module):
 # Mamba-2 mixer block.
 # ---------------------------------------------------------------------------
 class Mamba2Mixer(nn.Module):
-    def __init__(self, cfg: MambaConfig):
+    def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
         self.d_inner = cfg.d_inner
@@ -264,56 +221,3 @@ class Mamba2Mixer(nn.Module):
         return self.out_proj(y)
 
 
-class MambaBlock(nn.Module):
-    def __init__(self, cfg: MambaConfig):
-        super().__init__()
-        self.norm = _make_norm(cfg.d_model, cfg.use_rmsnorm)
-        self.mixer = Mamba2Mixer(cfg)
-        self.drop = nn.Dropout(cfg.dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.drop(self.mixer(self.norm(x)))
-
-
-class Mamba(nn.Module):
-    def __init__(self, cfg: MambaConfig):
-        super().__init__()
-        self.cfg = cfg
-        self.token_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.drop = nn.Dropout(cfg.dropout)
-        self.blocks = nn.ModuleList([MambaBlock(cfg) for _ in range(cfg.n_layer)])
-        self.ln_f = _make_norm(cfg.d_model, cfg.use_rmsnorm)
-        self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
-
-        self._init_weights()
-        if cfg.tie_weights:
-            self.head.weight = self.token_emb.weight
-
-    @torch.no_grad()
-    def _init_weights(self):
-        assert self.cfg.weight_init == "mamba", f"unknown weight_init: {self.cfg.weight_init!r}"
-        nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
-        if not self.cfg.tie_weights:
-            nn.init.normal_(self.head.weight, mean=0.0, std=0.02)
-
-        for blk in self.blocks:
-            m = blk.mixer
-            nn.init.normal_(m.in_proj.weight, mean=0.0, std=0.02)
-            # Zero the residual exit so each block is identity at step 0 (helps depth + Muon).
-            # SSM params (A_log/D/dt_bias) are canonically initialized inside Mamba2Mixer.
-            nn.init.zeros_(m.out_proj.weight)
-
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        x = self.drop(self.token_emb(idx))
-        if self.cfg.norm_emb:
-            x = self.ln_f(x)
-        for blk in self.blocks:
-            x = blk(x)
-        x = self.ln_f(x)
-        logits = self.head(x).float()
-        if self.cfg.logit_softcap > 0:
-            logits = self.cfg.logit_softcap * torch.tanh(logits / self.cfg.logit_softcap)
-        if targets is None:
-            return logits, None
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction="mean")
-        return logits, loss

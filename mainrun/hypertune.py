@@ -10,6 +10,8 @@ Usage:
   python hypertune.py plan <name>       # run a single named experiment
   python hypertune.py sweep             # run SEARCH_SPACE grid with SH
   python hypertune.py sweep --dry-run   # print candidates without running
+  python hypertune.py optuna [N]        # TPE search, N trials (default 60, resumable)
+  python hypertune.py optuna --dry-run  # preview sampled params without running
 """
 import itertools
 import json
@@ -50,9 +52,10 @@ FULL_EPOCHS   = 7
 KEEP_FRAC     = 0.5
 
 SEARCH_SPACE: dict[str, list] = {
-    "batch_size":  [128, 256, 512],
+    "block_size":  [64, 128, 256, 512],
+    "batch_size":  [128, 256],
     "muon_lr":     [0.015, 0.02, 0.03, 0.04],
-    "decay_frac":  [0.25, 0.30, 0.40, 0.50],
+    "decay_frac":  [0.50, 0.60, 0.70],
     "warmup_frac": [0.05, 0.10],
 }
 
@@ -62,39 +65,44 @@ SEARCH_SPACE: dict[str, list] = {
 # Results: d=384 dominated. Best: d=384 n=12 (1.2056), d=256/d=768 eliminated.
 ARCH_CANDIDATES_V1: list[dict] = [
     # d=256
-    {"d_model": 256, "n_layer": 20, "n_q_head": 4},  # ~15.5M
-    {"d_model": 256, "n_layer": 24, "n_q_head": 4},  # ~18.2M
-    {"d_model": 256, "n_layer": 28, "n_q_head": 4},  # ~20.9M
-    {"d_model": 256, "n_layer": 32, "n_q_head": 4},  # ~23.6M
-    {"d_model": 256, "n_layer": 36, "n_q_head": 4},  # ~26.2M
+    _arch_overrides(256, 20, 4),  # ~15.5M
+    _arch_overrides(256, 24, 4),  # ~18.2M
+    _arch_overrides(256, 28, 4),  # ~20.9M
+    _arch_overrides(256, 32, 4),  # ~23.6M
+    _arch_overrides(256, 36, 4),  # ~26.2M
     # d=384
-    {"d_model": 384, "n_layer":  8, "n_q_head": 6},  # ~15.2M
-    {"d_model": 384, "n_layer": 10, "n_q_head": 6},  # ~18.2M
-    {"d_model": 384, "n_layer": 12, "n_q_head": 6},  # ~21.2M  ← best
-    {"d_model": 384, "n_layer": 14, "n_q_head": 6},  # ~24.2M
+    _arch_overrides(384,  8, 6),  # ~15.2M
+    _arch_overrides(384, 10, 6),  # ~18.2M
+    _arch_overrides(384, 12, 6),  # ~21.2M  ← best
+    _arch_overrides(384, 14, 6),  # ~24.2M
     # d=512
-    {"d_model": 512, "n_layer":  5, "n_q_head": 8},  # ~17.6M
-    {"d_model": 512, "n_layer":  6, "n_q_head": 8},  # ~20.3M
-    {"d_model": 512, "n_layer":  7, "n_q_head": 8},  # ~23.0M
-    {"d_model": 512, "n_layer":  8, "n_q_head": 8},  # ~25.7M
+    _arch_overrides(512,  5, 8),  # ~17.6M
+    _arch_overrides(512,  6, 8),  # ~20.3M
+    _arch_overrides(512,  7, 8),  # ~23.0M
+    _arch_overrides(512,  8, 8),  # ~25.7M
     # d=768
-    {"d_model": 768, "n_layer":  2, "n_q_head": 12}, # ~18.4M
-    {"d_model": 768, "n_layer":  3, "n_q_head": 12}, # ~24.4M
+    _arch_overrides(768,  2, 12), # ~18.4M
+    _arch_overrides(768,  3, 12), # ~24.4M
 ]
 
 # Round 2: zoom in on d=384 + explore d=448
 ARCH_CANDIDATES_V2: list[dict] = [
     # d=384: push depth further
-    {"d_model": 384, "n_layer": 12, "n_q_head": 6},  # ~21.2M  ← current best
-    {"d_model": 384, "n_layer": 14, "n_q_head": 6},  # ~24.2M
-    {"d_model": 384, "n_layer": 16, "n_q_head": 6},  # ~26.6M
+    _arch_overrides(384, 12, 6),  # ~21.2M  ← current best
+    _arch_overrides(384, 14, 6),  # ~24.2M
+    _arch_overrides(384, 16, 6),  # ~26.6M
     # d=448: untested, between 384 and 512
-    {"d_model": 448, "n_layer":  8, "n_q_head": 7},  # ~20.2M
-    {"d_model": 448, "n_layer":  9, "n_q_head": 7},  # ~22.2M
-    {"d_model": 448, "n_layer": 10, "n_q_head": 7},  # ~24.3M
+    _arch_overrides(448,  8, 7),  # ~20.2M
+    _arch_overrides(448,  9, 7),  # ~22.2M
+    _arch_overrides(448, 10, 7),  # ~24.3M
 ]
 
 ARCH_CANDIDATES = ARCH_CANDIDATES_V2
+
+
+def _arch_overrides(d_model: int, n_layer: int, n_q_head: int, **rest) -> dict:
+    """Convert n_layer int → layer_pattern string for train_hybrid.py."""
+    return {"d_model": d_model, "layer_pattern": "A" * n_layer, "n_q_head": n_q_head, **rest}
 
 
 def estimate_params_M(d_model: int, n_layer: int, n_q_head: int,
@@ -122,7 +130,7 @@ SWEEP_EXPERIMENTS_DIR = "./experiments/sweep"
 
 def run(overrides: dict, epochs: int, experiments_dir: str) -> float:
     payload = {**overrides, "epochs": epochs, "experiments_dir": experiments_dir, "evals_per_epoch": 1}
-    cmd = [sys.executable, "train.py", json.dumps(payload)]
+    cmd = [sys.executable, "train_hybrid.py", json.dumps(payload)]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=None, text=True)
     lines = []
     for line in proc.stdout:
@@ -285,9 +293,100 @@ def run_arch_sweep(dry_run: bool = False):
     print("Arch sweep results (best first):")
     print(f"  {'rank':<6} {'val_loss':<10} {'d_model':<9} {'n_layer':<9} {'heads':<7} {'params_M'}")
     for rank, (loss, o) in enumerate(results, 1):
-        params = estimate_params_M(o['d_model'], o['n_layer'], o['n_q_head'])
-        print(f"  [{rank}]    {loss:.4f}    d={o['d_model']:<6} n={o['n_layer']:<6} h={o['n_q_head']:<4}  {params:.1f}M")
+        n_layer = len(o['layer_pattern'])
+        params = estimate_params_M(o['d_model'], n_layer, o['n_q_head'])
+        print(f"  [{rank}]    {loss:.4f}    d={o['d_model']:<6} n={n_layer:<6} h={o['n_q_head']:<4}  {params:.1f}M")
     print(f"{'='*60}\n")
+
+# ---------------------------------------------------------------------------
+# Optuna mode — TPE sampler + MedianPruner
+# ---------------------------------------------------------------------------
+
+OPTUNA_N_TRIALS = 60
+
+def _run_optuna_trial(overrides: dict, epochs: int, experiments_dir: str, trial) -> float:
+    """Like run(), but reports intermediate val_losses to Optuna for pruning."""
+    import optuna
+    payload = {**overrides, "epochs": epochs, "experiments_dir": experiments_dir, "evals_per_epoch": 3}
+    cmd = [sys.executable, "train_hybrid.py", json.dumps(payload)]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=None, text=True)
+    lines = []
+    step = 0
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+        lines.append(line)
+        if "validation_step: loss=" in line:
+            try:
+                val_loss = float(line.split("loss=")[1].split()[0])
+                trial.report(val_loss, step)
+                step += 1
+                if trial.should_prune():
+                    proc.terminate()
+                    proc.wait()
+                    raise optuna.TrialPruned()
+            except (ValueError, IndexError):
+                pass
+    proc.wait()
+    if proc.returncode != 0:
+        return float("inf")
+    return _parse_val_loss("".join(lines))
+
+
+def run_optuna(n_trials: int = OPTUNA_N_TRIALS, dry_run: bool = False):
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    db_path = Path(SWEEP_EXPERIMENTS_DIR) / "optuna.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    storage = f"sqlite:///{db_path}"
+
+    study = optuna.create_study(
+        study_name="hypertune",
+        storage=storage,
+        load_if_exists=True,
+        direction="minimize",
+        sampler=optuna.samplers.TPESampler(seed=1337),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=8, n_warmup_steps=3),
+    )
+
+    def objective(trial: optuna.Trial) -> float:
+        overrides = {
+            "block_size":  trial.suggest_categorical("block_size",  [64, 128, 256, 512]),
+            "batch_size":  trial.suggest_categorical("batch_size",  [128, 256]),
+            "muon_lr":     trial.suggest_float("muon_lr",  0.01, 0.05, log=True),
+            "decay_frac":  trial.suggest_float("decay_frac", 0.40, 0.75),
+            "warmup_frac": trial.suggest_categorical("warmup_frac", [0.05, 0.10]),
+            "min_lr_frac": trial.suggest_float("min_lr_frac", 0.01, 0.10, log=True),
+        }
+        if dry_run:
+            print(f"  [dry-run] trial {trial.number}: {overrides}")
+            return 0.0
+        _log(f"{SWEEP_EXPERIMENTS_DIR}/optuna_progress.log",
+             f"trial {trial.number:3d} start  {overrides}")
+        loss = _run_optuna_trial(overrides, ROUND1_EPOCHS, f"{SWEEP_EXPERIMENTS_DIR}/optuna", trial)
+        _log(f"{SWEEP_EXPERIMENTS_DIR}/optuna_progress.log",
+             f"trial {trial.number:3d} end    loss={loss:.4f}  {overrides}")
+        return loss
+
+    completed = len([t for t in study.trials if t.state.name == "COMPLETE"])
+    remaining = max(0, n_trials - completed)
+    print(f"\n{'='*60}")
+    print(f"Optuna TPE search: {n_trials} trials ({completed} done, {remaining} remaining)")
+    print(f"DB: {db_path}  (resumable)")
+    print(f"{'='*60}\n")
+
+    if dry_run:
+        for i in range(min(5, n_trials)):
+            study.ask()  # just to show sampled params
+        return
+
+    study.optimize(objective, n_trials=remaining)
+
+    print(f"\n{'='*60}")
+    print(f"Best val_loss: {study.best_value:.4f}")
+    print(f"Best params:   {study.best_params}")
+    print(f"{'='*60}\n")
+
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -302,6 +401,9 @@ if __name__ == "__main__":
         run_sweep(dry_run="--dry-run" in args)
     elif args[0] == "arch_sweep":
         run_arch_sweep(dry_run="--dry-run" in args)
+    elif args[0] == "optuna":
+        n = int(args[1]) if len(args) > 1 and args[1].isdigit() else OPTUNA_N_TRIALS
+        run_optuna(n_trials=n, dry_run="--dry-run" in args)
     else:
         print(__doc__)
         sys.exit(1)

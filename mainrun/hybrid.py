@@ -2,88 +2,37 @@
 Hybrid Mamba/Attention language model — one config, any layer recipe.
 
 The whole point: a single `layer_pattern` string decides what each layer is.
-  "AAAAAAAAAAAA"  -> pure Transformer (== train.py's GPT, the control)
+  "AAAAAAAAAAAA"  -> pure Transformer
   "MMMMMMMMMMMM"  -> pure Mamba-2 + MLP
   "MAMAMAMAMAMA"  -> 1:1 interleave (Samba-style)
   "MMMAMMMAMMMA"  -> 1:3, attention spread through the middle (Jamba-ish)
 
-This makes the hybrid design space a hyperparameter you can sweep, and lets the
-two pure architectures fall out as degenerate patterns for clean comparison.
+Structure of every block (decoupled token-mixer / channel-mixer):
+    x = x + token_mixer(norm(x))   # token_mixer = Attention OR Mamba-2
+    x = x + MLP(norm(x))
 
-Structure of every block (decoupled token-mixer / channel-mixer, like Samba/Jamba):
-    x = x + scale_mix * token_mixer(norm(x))   # token_mixer = Attention OR Mamba-2
-    x = x + scale_mlp * MLP(norm(x))            # channel mixer, identical everywhere
-
-We reuse train.py's CausalSelfAttention and MLP verbatim so the "A" layers are
-byte-for-byte the same operator as the existing GPT — any difference in results
-is attributable to the architecture mix, not to an incidental reimplementation.
-
-Positional info: only the attention layers consume RoPE. Mamba layers carry
-order through their conv + recurrence and ignore it.
+Positional info: only the attention layers consume RoPE.
 """
 
-import math
-from dataclasses import dataclass
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from attention import CausalSelfAttention, MLP
+from misc import make_norm
+from hparams import Hyperparameters
+from mamba import Mamba2Mixer
 from rope import RotaryEmbedding
-from train import CausalSelfAttention, MLP
-from mamba import Mamba2Mixer, _make_norm
-
-
-@dataclass
-class HybridConfig:
-    vocab_size: int
-    block_size: int
-    d_model: int
-    layer_pattern: str = "MMMAMMMAMMMA"  # 'M' = Mamba-2, 'A' = Attention; len == n_layer
-    dropout: float = 0.1
-
-    # --- attention ('A') layers ---
-    n_q_head: int = 6
-    n_kv_heads: int = 1            # 1 = MQA, n_q_head = MHA, in between = GQA
-    use_fa2: bool = True
-
-    # --- mamba ('M') layers ---
-    expand: int = 2               # d_inner = expand * d_model
-    d_head: int = 64              # mamba per-head dim P; n_heads = d_inner // d_head
-    d_state: int = 128            # SSM state dim N
-    n_groups: int = 1             # B/C shared across heads within a group
-    d_conv: int = 4
-    chunk_len: int = 64           # SSD chunk; must divide block_size
-    conv_bias: bool = True
-    proj_bias: bool = False
-
-    # --- shared ---
-    use_rmsnorm: bool = True
-    use_rezero: bool = True        # per-layer learnable residual scalars (init 0 -> identity at step 0)
-    tie_weights: bool = True
-    norm_emb: bool = False
-    logit_softcap: float = 15.0
-    mlp_act: str = "relu_sq"
-
-    @property
-    def n_layer(self) -> int:
-        return len(self.layer_pattern)
-
-    @property
-    def d_inner(self) -> int:
-        return self.expand * self.d_model
-
-    @property
-    def n_heads(self) -> int:
-        return self.d_inner // self.d_head
 
 
 class HybridBlock(nn.Module):
-    def __init__(self, cfg: HybridConfig, layer_type: str):
+    def __init__(self, cfg: SimpleNamespace, layer_type: str):
         super().__init__()
         self.layer_type = layer_type
-        self.ln1 = _make_norm(cfg.d_model, cfg.use_rmsnorm)
-        self.ln2 = _make_norm(cfg.d_model, cfg.use_rmsnorm)
+        self.ln1 = make_norm(cfg.d_model, cfg.norm)
+        self.ln2 = make_norm(cfg.d_model, cfg.norm)
         self.mixer = CausalSelfAttention(cfg) if layer_type == "A" else Mamba2Mixer(cfg)
         self.mlp = MLP(cfg)
         self.use_rezero = cfg.use_rezero
@@ -93,7 +42,6 @@ class HybridBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, cos_sin) -> torch.Tensor:
         h = self.ln1(x)
-        # Only attention needs RoPE; Mamba's signature is mixer(x).
         mix = self.mixer(h, cos_sin) if self.layer_type == "A" else self.mixer(h)
         if self.use_rezero:
             x = x + self.mixer_scale * mix
@@ -105,64 +53,126 @@ class HybridBlock(nn.Module):
 
 
 class HybridLM(nn.Module):
-    def __init__(self, cfg: HybridConfig):
+    def __init__(self, hp: Hyperparameters, vocab_size: int):
         super().__init__()
+        assert set(hp.arch.layer_pattern) <= {"M", "A"}, \
+            f"layer_pattern must be M/A only: {hp.arch.layer_pattern!r}"
+
+        d_inner = hp.mamba.expand * hp.arch.d_model
+        # Flat namespace for submodules (CausalSelfAttention, Mamba2Mixer, MLP).
+        cfg = SimpleNamespace(
+            vocab_size=vocab_size,
+            block_size=hp.train.block_size,
+            d_model=hp.arch.d_model,
+            dropout=hp.arch.dropout,
+            norm=hp.arch.norm,
+            use_rezero=hp.arch.use_rezero,
+            mlp_act=hp.arch.mlp_act,
+            # attention
+            n_q_head=hp.attention.n_q_head,
+            n_kv_heads=hp.attention.n_kv_heads,
+            use_fa2=hp.runtime.use_fa2,
+            # mamba
+            d_inner=d_inner,
+            n_heads=d_inner // hp.mamba.d_head,
+            d_head=hp.mamba.d_head,
+            d_state=hp.mamba.d_state,
+            n_groups=hp.mamba.n_groups,
+            d_conv=hp.mamba.d_conv,
+            chunk_len=hp.mamba.chunk_len,
+            conv_bias=True,
+            proj_bias=False,
+        )
+        self.hp = hp
         self.cfg = cfg
-        assert set(cfg.layer_pattern) <= {"M", "A"}, f"layer_pattern must be M/A only: {cfg.layer_pattern!r}"
+
         assert cfg.d_model % cfg.n_q_head == 0, "d_model must be divisible by n_q_head"
-        assert cfg.d_inner % cfg.d_head == 0, "d_inner must be divisible by d_head"
+        assert d_inner % hp.mamba.d_head == 0, "d_inner must be divisible by d_head"
         assert cfg.n_heads % cfg.n_groups == 0, "n_heads must be divisible by n_groups"
         assert cfg.block_size % cfg.chunk_len == 0, "block_size must be divisible by chunk_len"
 
-        self.token_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        self.token_emb = nn.Embedding(vocab_size, cfg.d_model)
         self.drop = nn.Dropout(cfg.dropout)
 
         head_dim = cfg.d_model // cfg.n_q_head
         self.rope = RotaryEmbedding(head_dim, max_seq_len=cfg.block_size)
-        self.blocks = nn.ModuleList([HybridBlock(cfg, t) for t in cfg.layer_pattern])
-        self.ln_f = _make_norm(cfg.d_model, cfg.use_rmsnorm)
-        self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+        self.blocks = nn.ModuleList([HybridBlock(cfg, t) for t in hp.arch.layer_pattern])
+        self.ln_f = make_norm(cfg.d_model, cfg.norm)
+        self.head = nn.Linear(cfg.d_model, vocab_size, bias=False)
+
+        if hp.arch.use_token_anchor:
+            self.x0_lambdas = nn.Parameter(torch.linspace(0.20, 0.05, hp.arch.n_layer))
+        if hp.arch.use_resid_scale:
+            assert hp.arch.use_token_anchor, "use_resid_scale requires use_token_anchor=True"
+            self.resid_lambdas = nn.Parameter(torch.linspace(1.15, 1.05, hp.arch.n_layer))
 
         self._init_weights()
-        if cfg.tie_weights:
+        if hp.arch.tie_weights:
             self.head.weight = self.token_emb.weight
 
-    @torch.no_grad()
     def _init_weights(self):
-        # Identity-start strategy mirrors train.py's GPT:
-        #   - with ReZero, the per-layer scale (init 0) already gives identity at step 0,
-        #     so residual-exit weights get a normal init.
-        #   - without ReZero, zero the residual exits instead (std=0 -> all zeros).
-        exit_std = 0.02 if self.cfg.use_rezero else 0.0
+        _plans = {"gpt2": self._init_gpt2, "muon_uniform": self._init_muon_uniform}
+        assert self.hp.arch.weight_init in _plans, f"unknown weight_init: {self.hp.arch.weight_init!r}"
+        _plans[self.hp.arch.weight_init]()
 
+    @torch.no_grad()
+    def _init_gpt2(self):
+        exit_std = 0.02 if self.hp.arch.use_rezero else 0.0
         nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
-        if not self.cfg.tie_weights:
+        if not self.hp.arch.tie_weights:
             nn.init.normal_(self.head.weight, mean=0.0, std=0.02)
-
         for blk in self.blocks:
-            nn.init.normal_(blk.mlp.net[0].weight, mean=0.0, std=0.02)   # MLP up
-            nn.init.normal_(blk.mlp.net[2].weight, mean=0.0, std=exit_std)  # MLP down (exit)
+            nn.init.normal_(blk.mlp.net[0].weight, mean=0.0, std=0.02)
+            nn.init.normal_(blk.mlp.net[2].weight, mean=0.0, std=exit_std)
             if blk.layer_type == "A":
                 nn.init.normal_(blk.mixer.q_proj.weight, mean=0.0, std=0.02)
                 nn.init.normal_(blk.mixer.kv_proj.weight, mean=0.0, std=0.02)
-                nn.init.normal_(blk.mixer.proj.weight, mean=0.0, std=exit_std)  # attn exit
+                nn.init.normal_(blk.mixer.proj.weight, mean=0.0, std=exit_std)
             else:
                 nn.init.normal_(blk.mixer.in_proj.weight, mean=0.0, std=0.02)
-                nn.init.normal_(blk.mixer.out_proj.weight, mean=0.0, std=exit_std)  # mamba exit
-                # A_log/D/dt_bias are canonically initialized inside Mamba2Mixer.
+                nn.init.normal_(blk.mixer.out_proj.weight, mean=0.0, std=exit_std)
+
+    @torch.no_grad()
+    def _init_muon_uniform(self):
+        nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
+        if not self.hp.arch.tie_weights:
+            nn.init.normal_(self.head.weight, mean=0.0, std=0.001)
+        for blk in self.blocks:
+            d = self.cfg.d_model
+            s = 3 ** 0.5 * d ** -0.5
+            nn.init.uniform_(blk.mlp.net[0].weight, -s * 0.4, s * 0.4)
+            nn.init.zeros_(blk.mlp.net[2].weight)
+            if blk.layer_type == "A":
+                nn.init.uniform_(blk.mixer.q_proj.weight, -s, s)
+                nn.init.uniform_(blk.mixer.kv_proj.weight, -s, s)
+                nn.init.zeros_(blk.mixer.proj.weight)
+            else:
+                nn.init.uniform_(blk.mixer.in_proj.weight, -s, s)
+                nn.init.zeros_(blk.mixer.out_proj.weight)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         B, T = idx.size()
-        x = self.drop(self.token_emb(idx))
-        if self.cfg.norm_emb:
-            x = self.ln_f(x)
+        x0 = self.drop(self.token_emb(idx))
+        if self.hp.arch.norm_emb:
+            x0 = self.ln_f(x0)
+        x = x0
         cos_sin = self.rope(x, T)
-        for blk in self.blocks:
+        for i, blk in enumerate(self.blocks):
+            if self.hp.arch.use_token_anchor:
+                r = self.resid_lambdas[i] if self.hp.arch.use_resid_scale else 1.0
+                x = r * x + self.x0_lambdas[i] * x0
             x = blk(x, cos_sin)
         x = self.ln_f(x)
+
+        if self.hp.runtime.use_fused_ce and targets is not None and torch.is_grad_enabled():
+            from kernels.fused_ce_v2 import fused_linear_ce_v2
+            loss = fused_linear_ce_v2(x.view(-1, x.size(-1)), self.head.weight,
+                                      targets.view(-1), logit_softcap=self.hp.arch.logit_softcap)
+            return None, loss
+
         logits = self.head(x).float()
-        if self.cfg.logit_softcap > 0:
-            logits = self.cfg.logit_softcap * torch.tanh(logits / self.cfg.logit_softcap)
+        if self.hp.arch.logit_softcap > 0:
+            logits = self.hp.arch.logit_softcap * torch.tanh(logits / self.hp.arch.logit_softcap)
         if targets is None:
             return logits, None
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction="mean")

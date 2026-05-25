@@ -44,7 +44,7 @@ class ModelArchHparams:
     d_model: int = 384
     dropout: float = 0.1
 
-    use_rmsnorm: bool = True
+    norm: Literal["rmsnorm", "layernorm"] = "rmsnorm"
     # use_rezero - False (default): muon_uniform init already zeros residual exits, giving identity-at-init
     # for free. Stacking ReZero (scale init=0) on top would multiply exit by 0×0 and kill
     # gradients entirely. Only set True when using weight_init="gpt2".

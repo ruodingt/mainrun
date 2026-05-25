@@ -1,0 +1,46 @@
+services:
+  nanoamd:
+    build:
+      context: .
+      dockerfile: amd.dockerfile
+      args:
+        - USER_ID=${UID:-1000}
+        - GROUP_ID=${GID:-1000}
+    container_name: nanoamd
+    image: nanoamd:latest
+    shm_size: 16gb
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
+      - kvm
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - .:/home/ubuntu/workspace
+      # - /etc/environment:/etc/environment:ro
+      - /home/${USER}/.ssh:/home/ubuntu/.ssh:ro
+      - /home/${USER}/.cache/nanochat:/home/ubuntu/.cache/nanochat
+    environment:
+      - HSA_OVERRIDE_GFX_VERSION=11.5.1
+      - WANDB_BASE_URL=http://wandb-local:8080
+      - http_proxy=socks5h://192.168.2.74:8888
+      - https_proxy=socks5h://192.168.2.74:8888
+      - no_proxy=127.0.0.1,localhost,::1,0.0.0.0,192.168.2.209
+      - HTTP_PROXY=socks5h://192.168.2.74:8888
+      - HTTPS_PROXY=socks5h://192.168.2.74:8888
+      - NO_PROXY=127.0.0.1,localhost,::1,0.0.0.0,192.168.2.209
+    stdin_open: true
+    tty: true
+    working_dir: /home/ubuntu/workspace/mainrun/mainrun
+    ports:
+      - "2222:22"
+      # TensorBoard UI (train.py writes events under ./experiments/expNNN/runNN/)
+      - "6006:6006"
+    command: bash /home/ubuntu/workspace/scripts/nanoamd-entrypoint.sh
+    restart: unless-stopped
+
+volumes:
+  wandb-local-data:
