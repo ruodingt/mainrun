@@ -99,6 +99,7 @@ class RuntimeHparams:
     evals_per_epoch: int = 3
     experiments_dir: str = "./experiments"
     log_file: str = "./logs/mainrun.log"
+    use_tqdm: bool = True
 
 
 @dataclass

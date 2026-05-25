@@ -250,7 +250,7 @@ class Trainer:
 
         for epoch in range(1, args.fixed.epochs + 1):
             for _ in tqdm(range(1, self.batches + 1), desc=f"Epoch {epoch}/{args.fixed.epochs}",
-                          disable=not sys.stderr.isatty()):
+                          disable=not args.runtime.use_tqdm):
                 step_start = time.time()
                 step += 1
 
