@@ -45,7 +45,7 @@ tasks:
     desc: Run train_hybrid on remote server in background
     deps: [checkpoint]
     cmds:
-      - '{{.SSH}} "cd {{.WORK_DIR}} && nohup {{.PYTHON}} train_hybrid.py > logs/train.out 2>logs/train.err </dev/null &"'
+      - '{{.SSH}} "cd {{.WORK_DIR}} && nohup {{.PYTHON}} train_hybrid.py > logs/train.out 2>logs/train.err </dev/null & disown"'
 
   sync:
     desc: Pull remote experiments and logs to local
@@ -65,7 +65,7 @@ tasks:
   hypertune:
     desc: "Launch hypertune on remote in background (usage: task hypertune -- plan|sweep|optuna)"
     cmds:
-      - '{{.SSH}} "cd {{.WORK_DIR}} && nohup {{.PYTHON}} hypertune.py {{.CLI_ARGS}} > logs/hypertune.out 2>logs/hypertune.err </dev/null &"'
+      - '{{.SSH}} "cd {{.WORK_DIR}} && nohup {{.PYTHON}} hypertune.py {{.CLI_ARGS}} > logs/hypertune.out 2>logs/hypertune.err </dev/null & disown"'
 
   hypertune-finish:
     desc: Sync results and checkpoint after hypertune completes
@@ -77,7 +77,7 @@ tasks:
     desc: "Run ablation group on remote in background (usage: task ablation -- group1)"
     deps: [checkpoint]
     cmds:
-      - '{{.SSH}} "cd {{.WORK_DIR}} && nohup {{.PYTHON}} -u ablation.py --group {{.CLI_ARGS}} > logs/ablation.out 2>logs/ablation.err </dev/null &"'
+      - '{{.SSH}} "cd {{.WORK_DIR}} && nohup {{.PYTHON}} -u ablation.py --group {{.CLI_ARGS}} > logs/ablation.out 2>logs/ablation.err </dev/null & disown"'
 
   ablation-logs:
     desc: "Tail ablation progress on remote"

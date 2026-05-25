@@ -134,6 +134,42 @@ groups:
           optimizer_type: muon_adamw
           pos_emb: rope
 
+      - name: g1_09_muon_wsd
+        desc: "Muon+AdamW + WSD schedule (gpt2 init)"
+        delta:
+          optimizer_type: muon_adamw
+          lr_schedule: wsd
+          warmup_frac: 0.05
+          min_lr_frac: 0.05
+
+      - name: g1_10_muon_init_wsd
+        desc: "Muon+AdamW + WSD + muon_uniform init"
+        delta:
+          optimizer_type: muon_adamw
+          lr_schedule: wsd
+          warmup_frac: 0.05
+          min_lr_frac: 0.05
+          weight_init: muon_uniform
+
+      - name: g1_11_muon_rope_wsd
+        desc: "Muon+AdamW + rope + WSD (gpt2 init)"
+        delta:
+          optimizer_type: muon_adamw
+          pos_emb: rope
+          lr_schedule: wsd
+          warmup_frac: 0.05
+          min_lr_frac: 0.05
+
+      - name: g1_12_muon_rope_init_wsd
+        desc: "Muon+AdamW + rope + WSD + muon_uniform init"
+        delta:
+          optimizer_type: muon_adamw
+          pos_emb: rope
+          lr_schedule: wsd
+          warmup_frac: 0.05
+          min_lr_frac: 0.05
+          weight_init: muon_uniform
+
   # ----------------------------------------------------------
   - name: group2
     desc: "Architecture tricks (Muon+AdamW + muon_uniform base)"
