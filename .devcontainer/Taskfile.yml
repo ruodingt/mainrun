@@ -1,0 +1,65 @@
+version: '3'
+
+tasks:
+  up:
+    desc: Start containers in the background
+    dir: '{{.TASKFILE_DIR}}'
+    cmds:
+      - docker compose up -d
+
+  down:
+    desc: Stop and remove containers
+    dir: '{{.TASKFILE_DIR}}'
+    cmds:
+      - docker compose down
+
+  shell:
+    desc: Open a shell inside the running container
+    cmds:
+      - docker exec -it nanoamd bash
+
+  tb:
+    desc: Start TensorBoard inside the container
+    cmds:
+      - docker exec -d nanoamd tensorboard --logdir /home/ubuntu/workspace/mainrun/mainrun/experiments --host=0.0.0.0 --port=6006
+
+  logs:
+    desc: Tail container logs
+    dir: '{{.TASKFILE_DIR}}'
+    cmds:
+      - docker compose logs -f
+
+  logs-nanoamd:
+    desc: Show nanoamd exit logs
+    dir: '{{.TASKFILE_DIR}}'
+    cmds:
+      - docker compose logs nanoamd
+
+  build:
+    desc: Rebuild the image (run after editing Dockerfile)
+    dir: '{{.TASKFILE_DIR}}'
+    cmds:
+      - docker compose build
+
+  restart:
+    desc: Rebuild image and restart containers
+    cmds:
+      - task: build
+      - task: down
+      - task: up
+
+  ressh:
+    desc: Clear stale SSH host key for 192.168.2.209:2222
+    cmds:
+      - ssh-keygen -R "[192.168.2.209]:2222"
+
+  pin:
+    desc: Install datasets via Tsinghua mirror
+    cmds:
+      - pip install datasets --proxy="" -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+  check-env:
+    desc: Verify ROCm and PyTorch environment
+    cmds:
+      - rocminfo
+      - python -c "import torch; print('CUDA Available:', torch.cuda.is_available())"

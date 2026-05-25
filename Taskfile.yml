@@ -1,5 +1,10 @@
 version: '3'
 
+includes:
+  dc:
+    taskfile: .devcontainer/Taskfile.yml
+    dir: .devcontainer
+
 tasks:
   checkpoint:
     dir: scripts

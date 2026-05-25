@@ -4,3 +4,8 @@ structlog==24.4.0
 tokenizers==0.21.2
 torch==2.7.1
 tqdm==4.67.1
+requests==2.34.2
+PySocks==1.7.1
+optuna==4.8.0
+PyYAML==6.0.3
+tensorboard==2.20.0
