@@ -22,9 +22,9 @@ YAML_PATH = Path(__file__).parent.parent / "tools" / "ablations.yaml"
 EXPERIMENTS_DIR = "./experiments/ablation"
 
 
-def load_yaml() -> tuple[dict, list[dict]]:
+def load_yaml() -> tuple[dict, list[dict], object]:
     data = yaml.safe_load(YAML_PATH.read_text())
-    return dict(data["base"]), data["groups"]
+    return dict(data["base"]), data["groups"], data.get("default_skip", False)
 
 
 def resolve(base: dict, group_base: dict, delta: dict) -> dict:
@@ -55,8 +55,7 @@ def find_result(group_name: str, name: str) -> dict | None:
 
 def run_experiment(cfg: dict, group_name: str, name: str, desc: str) -> dict | None:
     payload = build_payload(cfg, group_name, name)
-    print(f"\n{'='*60}")
-    print(f"Running: [{group_name}] {name}")
+    print(f"{'='*60}")
     print(f"  {desc}")
     print(f"{'='*60}")
     cmd = [sys.executable, "train_hybrid.py", json.dumps(payload)]
@@ -80,20 +79,25 @@ def print_summary(results: list[tuple[str, dict | None]]):
                   f"{r.get('total_params', 0):>12,}")
 
 
-def iter_experiments(groups: list[dict], group_filter: str | None, name_filter: str | None):
-    """Yield (group_name, name, desc, resolved_cfg) tuples."""
-    base_data, _ = load_yaml()  # not used here, caller passes base
+def iter_experiments(groups: list[dict], global_skip, group_filter: str | None, name_filter: str | None):
+    """Yield (group_name, name, desc, gb, delta, resolved_skip) tuples."""
     for group in groups:
         if group_filter and group["name"] != group_filter:
             continue
         gb = dict(group.get("group_base", {}))
+        group_skip = group.get("default_skip", global_skip)
         for entry in group.get("experiments", []):
             name = entry["name"]
             if name_filter and name != name_filter:
                 continue
+            # experiment-level overrides group, group overrides global
+            skip = entry.get("skip", group_skip)
+            if skip is True:
+                print(f"[skip] {name} — skip:true")
+                continue
             desc = entry.get("desc", "")
             delta = dict(entry.get("delta", {}))
-            yield group["name"], name, desc, gb, delta
+            yield group["name"], name, desc, gb, delta, skip
 
 
 def main():
@@ -104,12 +108,13 @@ def main():
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
-    base, groups = load_yaml()
+    base, groups, global_skip = load_yaml()
+
+    all_experiments = list(iter_experiments(groups, global_skip, args.group, args.name))
+    total = len(all_experiments)
 
     collected: list[tuple[str, dict | None]] = []
-    for group_name, name, desc, group_base, delta in iter_experiments(
-        groups, args.group, args.name
-    ):
+    for i, (group_name, name, desc, group_base, delta, skip) in enumerate(all_experiments, 1):
         cfg = resolve(base, group_base, delta)
 
         if args.list:
@@ -118,11 +123,12 @@ def main():
             continue
 
         existing = find_result(group_name, name)
-        if existing and not args.force:
-            print(f"[skip] {name} — results exist (--force to re-run)")
+        if existing and (skip == "auto" or not args.force):
+            print(f"[{i}/{total}] skip {name} — results exist (--force to re-run)")
             collected.append((name, existing))
             continue
 
+        print(f"\n[{i}/{total}] Starting {name}")
         result = run_experiment(cfg, group_name, name, desc)
         collected.append((name, result))
 

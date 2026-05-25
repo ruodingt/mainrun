@@ -3,8 +3,14 @@
 # Config resolution: root `base` → group `group_base` → experiment `delta`
 # Each level overwrites the previous. All keys map to flat hparam names.
 #
+# Skip resolution (highest priority wins):
+#   experiment.skip > group.default_skip > global default_skip
+#   Values: true (always skip), auto (skip if results exist), false (always run)
+#
 # Runtime hparams (use_compile, use_bf16, etc.) don't affect model quality
 # but are included in base for full reproducibility.
+
+default_skip: auto
 
 # ============================================================
 # Root base: exact train_old.py reproduction (all hparams)

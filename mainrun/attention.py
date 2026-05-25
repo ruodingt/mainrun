@@ -49,8 +49,11 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor, cos_sin) -> torch.Tensor:
         B, T, C = x.size()
-        q = self.q_proj(x).view(B, T, self.n_q_head, self.head_dim).transpose(1, 2)
-        kv = self.kv_proj(x).view(B, T, 2, self.n_kv_heads, self.head_dim).transpose(1, 3)
+        # contiguous() after transpose: fixes stride layout before RoPE or SDPA.
+        # Without it, torch.compile generates FA2 backward kernels assuming transposed strides,
+        # which breaks when RoPE's torch.cat changes q/k to contiguous layout.
+        q = self.q_proj(x).view(B, T, self.n_q_head, self.head_dim).transpose(1, 2).contiguous()
+        kv = self.kv_proj(x).view(B, T, 2, self.n_kv_heads, self.head_dim).transpose(1, 3).contiguous()
         k, v = kv[..., 0, :, :], kv[..., 1, :, :]
 
         if cos_sin is not None:
