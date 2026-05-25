@@ -73,6 +73,17 @@ tasks:
       - task: sync
       - task: checkpoint
 
+  ablation:
+    desc: "Run ablation group on remote in background (usage: task ablation -- group1)"
+    deps: [checkpoint]
+    cmds:
+      - '{{.SSH}} "cd {{.WORK_DIR}} && nohup {{.PYTHON}} ablation.py --group {{.CLI_ARGS}} > logs/ablation.out 2>logs/ablation.err &"'
+
+  ablation-logs:
+    desc: "Tail ablation progress on remote"
+    cmds:
+      - '{{.SSH}} "tail -f {{.WORK_DIR}}/logs/ablation.out"'
+
   hypertune-logs:
     desc: Check hypertune progress on remote
     cmds:

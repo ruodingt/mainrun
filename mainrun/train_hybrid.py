@@ -332,7 +332,8 @@ class Trainer:
             self.tb_writer.file_writer.add_summary(ssi)
             self.tb_writer.file_writer.add_summary(sei)
 
-        expt_util.save_run_results(self.run_dir, val_loss, time.time() - t0)
+        expt_util.save_run_results(self.run_dir, val_loss, time.time() - t0,
+                                   avg_tok_s=avg_tok_s, total_params=self.model_params)
 
         # Archive a copy of the log into the run dir for experiment record-keeping.
         import shutil

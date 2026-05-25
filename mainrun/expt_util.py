@@ -80,12 +80,18 @@ def create_run_dir(exp_dir: Path, args) -> Path:
     return run_path
 
 
-def save_run_results(run_dir: Path, val_loss: float, total_time_s: float):
+def save_run_results(run_dir: Path, val_loss: float, total_time_s: float,
+                     avg_tok_s: float = 0.0, total_params: int = 0):
     """Append final training results to run.yaml."""
     run_yaml_path = run_dir / "run.yaml"
     with open(run_yaml_path, 'r') as f:
         data = yaml.safe_load(f) or {}
-    data['results'] = {'val_loss': round(val_loss, 6), 'total_time_s': round(total_time_s, 1)}
+    data['results'] = {
+        'val_loss': round(val_loss, 6),
+        'total_time_s': round(total_time_s, 1),
+        'avg_tok_s': round(avg_tok_s, 1),
+        'total_params': total_params,
+    }
     with open(run_yaml_path, 'w') as f:
         yaml.safe_dump(data, f, default_flow_style=False, sort_keys=True)
 

@@ -46,9 +46,8 @@ class ModelArchHparams:
 
     norm: Literal["rmsnorm", "layernorm"] = "rmsnorm"
     pos_emb: Literal["rope", "learned"] = "rope"
-    # use_rezero - False (default): muon_uniform init already zeros residual exits, giving identity-at-init
-    # for free. Stacking ReZero (scale init=0) on top would multiply exit by 0×0 and kill
-    # gradients entirely. Only set True when using weight_init="gpt2".
+    # use_rezero - False (default): muon_uniform init already zeros residual exits (identity-at-init).
+    # Stacking ReZero (scale init=0) on top may compound this effect. Empirically untested with muon_uniform.
     use_rezero: bool = False
     use_token_anchor: bool = True   # per-layer learnable skip from original token embedding
     use_resid_scale: bool = False   # per-layer residual stream scaling; requires use_token_anchor=True
@@ -83,8 +82,8 @@ class OptimizerHparams:
 @dataclass
 class TrainHparams:
     """Training params that affect model quality — all included in fingerprint."""
-    batch_size: int = 128
-    block_size: int = 64
+    batch_size: int = 64
+    block_size: int = 128
     clip_norm_mode: Literal["all", "adamw"] = "all"  # "adamw": skip Muon params (self-normalizing)
 
 

@@ -1,0 +1,139 @@
+# Ablation study configuration.
+#
+# Config resolution: root `base` → group `group_base` → experiment `delta`
+# Each level overwrites the previous. All keys map to flat hparam names.
+#
+# Runtime hparams (use_compile, use_bf16, etc.) don't affect model quality
+# but are included in base for full reproducibility.
+
+# ============================================================
+# Root base: exact train_old.py reproduction (all hparams)
+# ============================================================
+base:
+  # --- ModelArchHparams ---
+  layer_pattern: AAAAAA     # n_layer=6
+  vocab_size: 16000
+  d_model: 512
+  dropout: 0.1
+  norm: layernorm
+  pos_emb: learned
+  use_rezero: false
+  use_token_anchor: false
+  use_resid_scale: false
+  weight_init: gpt2
+  tie_weights: false
+  norm_emb: false
+  logit_softcap: 0.0
+  mlp_act: gelu
+  # --- AttentionHparams ---
+  n_q_head: 8
+  n_kv_heads: 8             # MHA
+  # --- MambaHparams (inactive — no M layers) ---
+  expand: 2
+  d_head: 64
+  d_state: 128
+  n_groups: 1
+  d_conv: 4
+  chunk_len: 64
+  # --- OptimizerHparams ---
+  optimizer_type: sgd
+  muon_lr: 0.02
+  adamw_lr: 3.0e-4
+  emb_lr: 3.0e-3
+  scalar_lr: 1.0e-3
+  adamw_wd: 0.1
+  sgd_lr: 6.0e-3
+  sgd_wd: 0.0
+  lr_schedule: cosine
+  warmup_frac: 0.0
+  decay_frac: 0.60
+  min_lr_frac: 0.0
+  # --- TrainHparams ---
+  batch_size: 64
+  block_size: 128
+  clip_norm_mode: all
+  # --- RuntimeHparams ---
+  use_fa2: true
+  use_fused_ce: false
+  use_compile: true
+  use_bf16: true
+  evals_per_epoch: 1
+  use_tqdm: true
+  # --- FixedHparams ---
+  epochs: 7
+  seed: 1337
+  num_titles: 100000
+  val_frac: 0.10
+
+# ============================================================
+# Groups
+# ============================================================
+groups:
+
+  # ----------------------------------------------------------
+  - name: group1
+    desc: "Optimizer isolation (train_old base, no arch changes)"
+    group_base: {}
+    experiments:
+      - name: g1_00_baseline
+        desc: "baseline reproduction"
+
+      - name: g1_01_muon
+        desc: "Muon+AdamW only, all else unchanged"
+        delta:
+          optimizer_type: muon_adamw
+
+      - name: g1_02_muon_init
+        desc: "Muon+AdamW + muon_uniform init"
+        delta:
+          optimizer_type: muon_adamw
+          weight_init: muon_uniform
+
+      - name: g1_03_muon_rezero
+        desc: "Muon+AdamW + ReZero (gpt2 init)"
+        delta:
+          optimizer_type: muon_adamw
+          use_rezero: true
+
+      - name: g1_04_muon_init_rezero
+        desc: "Muon+AdamW + muon_uniform init + ReZero"
+        delta:
+          optimizer_type: muon_adamw
+          weight_init: muon_uniform
+          use_rezero: true
+
+      - name: g1_05_muon_uni_init_rope
+        desc: "Muon-AdamW + muon_uniform init + rope"
+        delta:
+          optimizer_type: muon_adamw
+          weight_init: muon_uniform
+          pos_emb: rope
+
+  # ----------------------------------------------------------
+  - name: group2
+    desc: "Architecture tricks (Muon+AdamW + muon_uniform base)"
+    group_base:
+      optimizer_type: muon_adamw
+      weight_init: muon_uniform
+    experiments:
+      - name: g2_00_base
+        desc: "Group2 base: Muon + muon_uniform, no tricks"
+
+      - name: g2_01_token_anchor
+        desc: "Add token anchor"
+        delta:
+          use_token_anchor: true
+
+      - name: g2_02_token_anchor_resid_scale
+        desc: "Token anchor + residual stream scaling"
+        delta:
+          use_token_anchor: true
+          use_resid_scale: true
+
+      # TODO: add more group2 experiments
+
+  # ----------------------------------------------------------
+  - name: group3
+    desc: "Normalization variants (group_base TBD after group2 results)"
+    group_base: {}  # TODO: fill in after group2
+    experiments: []
