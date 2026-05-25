@@ -7,7 +7,7 @@ includes:
 
 vars:
   SSH: ssh amd-container
-  WORK_DIR: ~/workspace/mainrun
+  WORK_DIR: ~/workspace
   PYTHON: /opt/venv/bin/python
 
 tasks:
