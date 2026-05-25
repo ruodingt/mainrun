@@ -235,3 +235,44 @@ groups:
         delta:
           mlp_act: relu_sq
           tie_weights: true
+
+  # ----------------------------------------------------------
+  - name: group3
+    desc: "Additive chain on best config (swiglu+tie base)"
+    group_base:
+      optimizer_type: muon_adamw
+      pos_emb: rope
+      lr_schedule: wsd
+      warmup_frac: 0.05
+      min_lr_frac: 0.05
+      mlp_act: swiglu
+      tie_weights: true
+    experiments:
+      - name: g3_00_base
+        desc: "Group3 base: muon+rope+wsd+swiglu+tie (best so far 1.1836)"
+
+      - name: g3_01_rmsnorm
+        desc: "+RMSNorm"
+        delta:
+          norm: rmsnorm
+
+      - name: g3_02_token_anchor
+        desc: "+token anchor"
+        delta:
+          use_token_anchor: true
+
+      - name: g3_03_softcap
+        desc: "+logit softcap"
+        delta:
+          logit_softcap: 15.0
+
+      - name: g3_04_mqa
+        desc: "+MQA (1 KV head)"
+        delta:
+          n_kv_heads: 1
+
+      - name: g3_05_anchor_softcap
+        desc: "+token anchor + softcap"
+        delta:
+          use_token_anchor: true
+          logit_softcap: 15.0
