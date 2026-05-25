@@ -223,3 +223,15 @@ groups:
         desc: "ReLU² activation"
         delta:
           mlp_act: relu_sq
+
+      - name: g2_09_swiglu_tie
+        desc: "SwiGLU + tie_weights"
+        delta:
+          mlp_act: swiglu
+          tie_weights: true
+
+      - name: g2_10_relu_sq_tie
+        desc: "ReLU² + tie_weights"
+        delta:
+          mlp_act: relu_sq
+          tie_weights: true
