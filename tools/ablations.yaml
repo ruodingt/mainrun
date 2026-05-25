@@ -109,10 +109,29 @@ groups:
           use_rezero: true
 
       - name: g1_05_muon_uni_init_rope
-        desc: "Muon-AdamW + muon_uniform init + rope"
+        desc: "Muon+AdamW + muon_uniform init + rope"
         delta:
           optimizer_type: muon_adamw
           weight_init: muon_uniform
+          pos_emb: rope
+
+      - name: g1_06_muon_clip_adamw
+        desc: "Muon+AdamW + clip_norm_mode=adamw (skip clipping muon params)"
+        delta:
+          optimizer_type: muon_adamw
+          clip_norm_mode: adamw
+
+      - name: g1_07_muon_init_clip_adamw
+        desc: "Muon+AdamW + muon_uniform init + clip_norm_mode=adamw"
+        delta:
+          optimizer_type: muon_adamw
+          weight_init: muon_uniform
+          clip_norm_mode: adamw
+
+      - name: g1_08_muon_rope
+        desc: "Muon+AdamW + rope (gpt2 init)"
+        delta:
+          optimizer_type: muon_adamw
           pos_emb: rope
 
   # ----------------------------------------------------------

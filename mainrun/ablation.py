@@ -124,11 +124,14 @@ def main():
 
         existing = find_result(group_name, name)
         if existing and (skip == "auto" or not args.force):
-            print(f"[{i}/{total}] skip {name} — results exist (--force to re-run)")
+            print(f"[{i}/{total}] SKIP  {name} — results exist", flush=True)
             collected.append((name, existing))
             continue
 
-        print(f"\n[{i}/{total}] Starting {name}")
+        print(f"\n{'#'*60}", flush=True)
+        print(f"# [{i}/{total}] {name}", flush=True)
+        print(f"# {desc}", flush=True)
+        print(f"{'#'*60}\n", flush=True)
         result = run_experiment(cfg, group_name, name, desc)
         collected.append((name, result))
 
