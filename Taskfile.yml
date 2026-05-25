@@ -28,16 +28,18 @@ tasks:
       - python3 train.py
 
   train-local:
-    desc: Run train_hybrid locally (no checkpoint)
+    desc: Run train_hybrid locally (with checkpoint)
+    deps: [checkpoint]
     dir: mainrun/mainrun
     cmds:
       - python3 train_hybrid.py
 
   train-remote:
-    desc: Run train_hybrid on remote server (with checkpoint)
+    desc: Run train_hybrid on remote server (with checkpoint, then sync)
     deps: [checkpoint]
     cmds:
-      - '{{.SSH}} "cd {{.WORK_DIR}} && {{.PYTHON}} train_hybrid.py"'
+      - '{{.SSH}} "cd {{.WORK_DIR}}/mainrun && {{.PYTHON}} train_hybrid.py"'
+      - task: sync
 
   train-nohup:
     desc: Run train_hybrid on remote server in background
@@ -45,10 +47,16 @@ tasks:
     cmds:
       - '{{.SSH}} "cd {{.WORK_DIR}} && nohup python3 train_hybrid.py > train.log 2>train.err &"'
 
+  sync:
+    desc: Pull remote experiments and logs to local
+    cmds:
+      - rsync -avz amd-container:{{.WORK_DIR}}/mainrun/experiments/ mainrun/mainrun/experiments/
+      - rsync -avz amd-container:{{.WORK_DIR}}/mainrun/logs/ mainrun/mainrun/logs/
+
   logs:
     desc: Tail remote training log
     cmds:
-      - '{{.SSH}} "tail -f {{.WORK_DIR}}/train.log"'
+      - '{{.SSH}} "tail -f {{.WORK_DIR}}/mainrun/logs/mainrun.log"'
 
   submit:
     deps: [checkpoint]

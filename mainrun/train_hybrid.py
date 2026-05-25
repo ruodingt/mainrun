@@ -100,7 +100,7 @@ class Trainer:
         args = self.args
         exp_dir = expt_util.get_or_create_experiment_dir(args, base_dir=args.runtime.experiments_dir)
         run_dir = expt_util.create_run_dir(exp_dir, args)
-        args.runtime.log_file = str(run_dir / "log.txt")
+        # Write to the fixed path that checkpoint.mjs expects to find and rotate.
         self.logger = expt_util.configure_logging(args.runtime.log_file)
         self.tb_writer = SummaryWriter(log_dir=str(run_dir))
         self.exp_dir = exp_dir
@@ -329,6 +329,10 @@ class Trainer:
             self.tb_writer.file_writer.add_summary(sei)
 
         expt_util.save_run_results(self.run_dir, val_loss, time.time() - t0)
+
+        # Archive a copy of the log into the run dir for experiment record-keeping.
+        import shutil
+        shutil.copy(self.args.runtime.log_file, self.run_dir / "log.txt")
 
     # ------------------------------------------------------------------
 
