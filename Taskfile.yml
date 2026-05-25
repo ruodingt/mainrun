@@ -38,7 +38,7 @@ tasks:
     desc: Run train_hybrid on remote server (with checkpoint, then sync)
     deps: [checkpoint]
     cmds:
-      - '{{.SSH}} "cd {{.WORK_DIR}}/mainrun && {{.PYTHON}} train_hybrid.py"'
+      - '{{.SSH}} "cd {{.WORK_DIR}}/mainrun/mainrun && {{.PYTHON}} train_hybrid.py {{.CLI_ARGS}}"'
       - task: sync
 
   train-nohup:
