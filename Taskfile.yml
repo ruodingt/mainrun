@@ -45,18 +45,39 @@ tasks:
     desc: Run train_hybrid on remote server in background
     deps: [checkpoint]
     cmds:
-      - '{{.SSH}} "cd {{.WORK_DIR}} && nohup python3 train_hybrid.py > train.log 2>train.err &"'
+      - '{{.SSH}} "cd {{.WORK_DIR}}/mainrun/mainrun && nohup {{.PYTHON}} train_hybrid.py > logs/train.out 2>logs/train.err &"'
 
   sync:
     desc: Pull remote experiments and logs to local
     cmds:
-      - rsync -avz amd-container:{{.WORK_DIR}}/mainrun/experiments/ mainrun/mainrun/experiments/
-      - rsync -avz amd-container:{{.WORK_DIR}}/mainrun/logs/ mainrun/mainrun/logs/
+      - rsync -avz amd-container:{{.WORK_DIR}}/mainrun/logs/ mainrun/logs/
 
   logs:
-    desc: Tail remote training log
+    desc: Tail remote training log (stdout) and tqdm (stderr)
     cmds:
-      - '{{.SSH}} "tail -f {{.WORK_DIR}}/mainrun/logs/mainrun.log"'
+      - '{{.SSH}} "tail -f {{.WORK_DIR}}/mainrun/mainrun/logs/mainrun.log"'
+
+  logs-tqdm:
+    desc: Tail remote tqdm progress (stderr)
+    cmds:
+      - '{{.SSH}} "tail -f {{.WORK_DIR}}/mainrun/mainrun/logs/train.err"'
+
+  hypertune:
+    desc: "Launch hypertune on remote in background (usage: task hypertune -- plan|sweep|optuna)"
+    cmds:
+      - '{{.SSH}} "cd {{.WORK_DIR}}/mainrun/mainrun && nohup {{.PYTHON}} hypertune.py {{.CLI_ARGS}} > logs/hypertune.out 2>logs/hypertune.err &"'
+
+  hypertune-finish:
+    desc: Sync results and checkpoint after hypertune completes
+    cmds:
+      - task: sync
+      - task: checkpoint
+
+  hypertune-logs:
+    desc: Check hypertune progress on remote
+    cmds:
+      - '{{.SSH}} "ls -lt {{.WORK_DIR}}/mainrun/mainrun/logs/hypertune_*.log 2>/dev/null | head -20"'
+      - '{{.SSH}} "tail -3 {{.WORK_DIR}}/mainrun/mainrun/logs/hypertune_*.log 2>/dev/null"'
 
   submit:
     deps: [checkpoint]

@@ -3,6 +3,7 @@ import contextlib
 import math
 import os
 import random
+import sys
 import time
 from typing import Any
 
@@ -247,7 +248,8 @@ class Trainer:
         t0 = time.time()
 
         for epoch in range(1, args.fixed.epochs + 1):
-            for _ in tqdm(range(1, self.batches + 1), desc=f"Epoch {epoch}/{args.fixed.epochs}"):
+            for _ in tqdm(range(1, self.batches + 1), desc=f"Epoch {epoch}/{args.fixed.epochs}",
+                          disable=not sys.stderr.isatty()):
                 step_start = time.time()
                 step += 1
 

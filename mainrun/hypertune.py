@@ -128,8 +128,10 @@ SWEEP_EXPERIMENTS_DIR = "./experiments/sweep"
 # Core: run a single experiment
 # ---------------------------------------------------------------------------
 
-def run(overrides: dict, epochs: int, experiments_dir: str) -> float:
+def run(overrides: dict, epochs: int, experiments_dir: str, log_file: str | None = None) -> float:
     payload = {**overrides, "epochs": epochs, "experiments_dir": experiments_dir, "evals_per_epoch": 1}
+    if log_file:
+        payload["log_file"] = log_file
     cmd = [sys.executable, "train_hybrid.py", json.dumps(payload)]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=None, text=True)
     lines = []
@@ -181,7 +183,8 @@ def run_plan(target_name: str | None = None):
     for name, desc, overrides in experiments:
         print(f"  [{name}] {desc}")
         print(f"    overrides: {overrides}")
-        loss = run(overrides, FULL_EPOCHS, f"{PLAN_EXPERIMENTS_DIR}/{name}")
+        loss = run(overrides, FULL_EPOCHS, f"{PLAN_EXPERIMENTS_DIR}/{name}",
+                   log_file=f"./logs/hypertune_plan_{name}.log")
         results.append((loss, name, desc, overrides))
         status = f"{loss:.4f}" if loss != float("inf") else "FAILED"
         _log(log_path, f"{name:<20} val_loss={status}  {overrides}")
@@ -224,7 +227,8 @@ def run_sweep(dry_run: bool = False):
     r1 = []
     for i, overrides in enumerate(candidates):
         print(f"  [{i+1}/{len(candidates)}] {overrides} ", end="", flush=True)
-        loss = run(overrides, ROUND1_EPOCHS, f"{SWEEP_EXPERIMENTS_DIR}/round1")
+        loss = run(overrides, ROUND1_EPOCHS, f"{SWEEP_EXPERIMENTS_DIR}/round1",
+                   log_file=f"./logs/hypertune_sweep_r1_{i+1:03d}.log")
         print(f"→ {loss:.4f}")
         _log(log_path, f"r1 [{i+1:2d}/{len(candidates)}] {loss:.4f}  {overrides}")
         r1.append((loss, overrides))
@@ -246,7 +250,8 @@ def run_sweep(dry_run: bool = False):
     r2 = []
     for i, overrides in enumerate(survivors):
         print(f"  [{i+1}/{keep}] {overrides} ", end="", flush=True)
-        loss = run(overrides, FULL_EPOCHS, f"{SWEEP_EXPERIMENTS_DIR}/round2")
+        loss = run(overrides, FULL_EPOCHS, f"{SWEEP_EXPERIMENTS_DIR}/round2",
+                   log_file=f"./logs/hypertune_sweep_r2_{i+1:03d}.log")
         print(f"→ {loss:.4f}")
         _log(log_path, f"r2 [{i+1:2d}/{keep}] {loss:.4f}  {overrides}")
         r2.append((loss, overrides))
@@ -304,10 +309,12 @@ def run_arch_sweep(dry_run: bool = False):
 
 OPTUNA_N_TRIALS = 60
 
-def _run_optuna_trial(overrides: dict, epochs: int, experiments_dir: str, trial) -> float:
+def _run_optuna_trial(overrides: dict, epochs: int, experiments_dir: str, trial, log_file: str | None = None) -> float:
     """Like run(), but reports intermediate val_losses to Optuna for pruning."""
     import optuna
     payload = {**overrides, "epochs": epochs, "experiments_dir": experiments_dir, "evals_per_epoch": 3}
+    if log_file:
+        payload["log_file"] = log_file
     cmd = [sys.executable, "train_hybrid.py", json.dumps(payload)]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=None, text=True)
     lines = []
@@ -363,7 +370,8 @@ def run_optuna(n_trials: int = OPTUNA_N_TRIALS, dry_run: bool = False):
             return 0.0
         _log(f"{SWEEP_EXPERIMENTS_DIR}/optuna_progress.log",
              f"trial {trial.number:3d} start  {overrides}")
-        loss = _run_optuna_trial(overrides, ROUND1_EPOCHS, f"{SWEEP_EXPERIMENTS_DIR}/optuna", trial)
+        loss = _run_optuna_trial(overrides, ROUND1_EPOCHS, f"{SWEEP_EXPERIMENTS_DIR}/optuna", trial,
+                                 log_file=f"./logs/hypertune_optuna_{trial.number:03d}.log")
         _log(f"{SWEEP_EXPERIMENTS_DIR}/optuna_progress.log",
              f"trial {trial.number:3d} end    loss={loss:.4f}  {overrides}")
         return loss
