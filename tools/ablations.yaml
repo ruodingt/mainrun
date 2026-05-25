@@ -172,29 +172,54 @@ groups:
 
   # ----------------------------------------------------------
   - name: group2
-    desc: "Architecture tricks (Muon+AdamW + muon_uniform base)"
+    desc: "Architecture tricks (best optimizer from group1: muon+rope+wsd+gpt2init)"
     group_base:
       optimizer_type: muon_adamw
-      weight_init: muon_uniform
+      pos_emb: rope
+      lr_schedule: wsd
+      warmup_frac: 0.05
+      min_lr_frac: 0.05
     experiments:
       - name: g2_00_base
-        desc: "Group2 base: Muon + muon_uniform, no tricks"
+        desc: "Group2 base: muon+rope+wsd, no arch tricks"
 
       - name: g2_01_token_anchor
-        desc: "Add token anchor"
+        desc: "Token anchor (per-layer learnable skip from embedding)"
         delta:
           use_token_anchor: true
 
-      - name: g2_02_token_anchor_resid_scale
-        desc: "Token anchor + residual stream scaling"
+      - name: g2_02_softcap
+        desc: "Logit tanh softcap (cap=15)"
+        delta:
+          logit_softcap: 15.0
+
+      - name: g2_03_rmsnorm
+        desc: "RMSNorm instead of LayerNorm"
+        delta:
+          norm: rmsnorm
+
+      - name: g2_04_mqa
+        desc: "Multi-query attention (1 KV head)"
+        delta:
+          n_kv_heads: 1
+
+      - name: g2_05_tie_weights
+        desc: "Tie lm_head weights to token embedding"
+        delta:
+          tie_weights: true
+
+      - name: g2_06_anchor_softcap
+        desc: "Token anchor + logit softcap (expected best combo)"
         delta:
           use_token_anchor: true
-          use_resid_scale: true
+          logit_softcap: 15.0
 
-      # TODO: add more group2 experiments
+      - name: g2_07_swiglu
+        desc: "SwiGLU activation (iso-param vs GELU)"
+        delta:
+          mlp_act: swiglu
 
-  # ----------------------------------------------------------
-  - name: group3
-    desc: "Normalization variants (group_base TBD after group2 results)"
-    group_base: {}  # TODO: fill in after group2
-    experiments: []
+      - name: g2_08_relu_sq
+        desc: "ReLU² activation"
+        delta:
+          mlp_act: relu_sq

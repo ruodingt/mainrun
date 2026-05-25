@@ -79,6 +79,11 @@ tasks:
     cmds:
       - '{{.SSH}} "cd {{.WORK_DIR}} && nohup {{.PYTHON}} -u ablation.py --group {{.CLI_ARGS}} > logs/ablation.out 2>logs/ablation.err </dev/null & disown"'
 
+  sync-ablation:
+    desc: "Sync ablation results and logs from remote (usage: task sync-ablation -- group1)"
+    cmds:
+      - .venv/bin/python tools/sync_ablation.py {{.CLI_ARGS}}
+
   ablation-logs:
     desc: "Tail ablation progress on remote"
     cmds:
