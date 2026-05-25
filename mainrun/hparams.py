@@ -45,6 +45,7 @@ class ModelArchHparams:
     dropout: float = 0.1
 
     norm: Literal["rmsnorm", "layernorm"] = "rmsnorm"
+    pos_emb: Literal["rope", "learned"] = "rope"
     # use_rezero - False (default): muon_uniform init already zeros residual exits, giving identity-at-init
     # for free. Stacking ReZero (scale init=0) on top would multiply exit by 0×0 and kill
     # gradients entirely. Only set True when using weight_init="gpt2".
@@ -64,11 +65,14 @@ class ModelArchHparams:
 
 @dataclass
 class OptimizerHparams:
+    optimizer_type: Literal["muon_adamw", "sgd"] = "muon_adamw"
     muon_lr: float = 0.02       # Muon: 2D weight matrices (attn, mlp)
     adamw_lr: float = 3e-4      # AdamW: norms, biases, other 1D params
     emb_lr: float = 3e-3        # AdamW: token_emb (sparse updates → slightly higher LR)
     scalar_lr: float = 1e-3     # AdamW: ReZero scalars, x0_lambdas
     adamw_wd: float = 0.1
+    sgd_lr: float = 6e-3        # SGD baseline LR (matches train_old.py)
+    sgd_wd: float = 0.0         # SGD weight decay
 
     lr_schedule: Literal["wsd", "cosine"] = "wsd"
     warmup_frac: float = 0.05
@@ -87,6 +91,7 @@ class TrainHparams:
 @dataclass
 class RuntimeHparams:
     """Execution config — doesn't affect loss numerics, excluded from fingerprint."""
+    device: str = "cuda"            # "cuda", "cpu"
     use_fa2: bool = True            # FlashAttention-2 kernel; same math, different execution path
     use_fused_ce: bool = False      # fused linear+CE kernel (~0.6x speed on RDNA4)
     use_compile: bool = True

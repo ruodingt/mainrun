@@ -5,6 +5,10 @@ includes:
     taskfile: .devcontainer/Taskfile.yml
     dir: .devcontainer
 
+vars:
+  SSH: ssh amd-container
+  WORK_DIR: ~/workspace/mainrun
+
 tasks:
   checkpoint:
     dir: scripts
@@ -22,14 +26,31 @@ tasks:
     cmds:
       - python3 train.py
 
-  train_nohup:
-    dir: mainrun
+  train-local:
+    desc: Run train_hybrid locally (no checkpoint)
+    dir: mainrun/mainrun
     cmds:
-      - nohup python3 train.py sweep > train.log 2>train.err &
+      - python3 train_hybrid.py
+
+  train-remote:
+    desc: Run train_hybrid on remote server (with checkpoint)
+    deps: [checkpoint]
+    cmds:
+      - '{{.SSH}} "cd {{.WORK_DIR}} && python3 train_hybrid.py"'
+
+  train-nohup:
+    desc: Run train_hybrid on remote server in background
+    deps: [checkpoint]
+    cmds:
+      - '{{.SSH}} "cd {{.WORK_DIR}} && nohup python3 train_hybrid.py > train.log 2>train.err &"'
+
+  logs:
+    desc: Tail remote training log
+    cmds:
+      - '{{.SSH}} "tail -f {{.WORK_DIR}}/train.log"'
 
   submit:
     deps: [checkpoint]
     dir: scripts
     cmds:
       - npx zx submit.mjs
-    

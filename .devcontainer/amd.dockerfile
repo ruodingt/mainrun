@@ -22,7 +22,7 @@ RUN npm install -g zx
 RUN mkdir /var/run/sshd
 
 # Setup python venv
-RUN python3 -m venv /opt/venv && chown -R ubuntu:ubuntu /opt/venv
+RUN python3 -m venv /opt/venv --system-site-packages && chown -R ubuntu:ubuntu /opt/venv
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
@@ -42,9 +42,9 @@ RUN echo "devcontainer" >> /root/.mainrun
 USER ubuntu
 WORKDIR /home/ubuntu/workspace
 
-COPY requirements.txt* /tmp/
+COPY requirements.amd.txt* /tmp/
 
-RUN pip install -r /tmp/requirements.txt --proxy="" -i https://pypi.tuna.tsinghua.edu.cn/simple
+RUN pip install -r /tmp/requirements.amd.txt --proxy="" -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 RUN echo "source /opt/venv/bin/activate" >> /home/ubuntu/.bashrc
 RUN echo "export HSA_OVERRIDE_GFX_VERSION=11.5.1" >> /home/ubuntu/.bashrc

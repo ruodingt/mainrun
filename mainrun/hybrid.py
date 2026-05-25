@@ -94,8 +94,11 @@ class HybridLM(nn.Module):
         self.token_emb = nn.Embedding(vocab_size, cfg.d_model)
         self.drop = nn.Dropout(cfg.dropout)
 
-        head_dim = cfg.d_model // cfg.n_q_head
-        self.rope = RotaryEmbedding(head_dim, max_seq_len=cfg.block_size)
+        if hp.arch.pos_emb == "rope":
+            head_dim = cfg.d_model // cfg.n_q_head
+            self.rope = RotaryEmbedding(head_dim, max_seq_len=cfg.block_size)
+        else:
+            self.pos_emb = nn.Parameter(torch.zeros(1, cfg.block_size, cfg.d_model))
         self.blocks = nn.ModuleList([HybridBlock(cfg, t) for t in hp.arch.layer_pattern])
         self.ln_f = make_norm(cfg.d_model, cfg.norm)
         self.head = nn.Linear(cfg.d_model, vocab_size, bias=False)
@@ -156,7 +159,14 @@ class HybridLM(nn.Module):
         if self.hp.arch.norm_emb:
             x0 = self.ln_f(x0)
         x = x0
-        cos_sin = self.rope(x, T)
+        if self.hp.arch.pos_emb == "rope":
+            cos_sin = self.rope(x, T)
+        else:
+            # Note: dropout is applied to token_emb only, not to pos_emb.
+            # train_old.py applies dropout to (tok + pos) together — a minor difference
+            # that likely explains any loss delta between the two baselines.
+            x = x + self.pos_emb[:, :T]
+            cos_sin = None
         for i, blk in enumerate(self.blocks):
             if self.hp.arch.use_token_anchor:
                 r = self.resid_lambdas[i] if self.hp.arch.use_resid_scale else 1.0

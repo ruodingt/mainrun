@@ -53,8 +53,9 @@ class CausalSelfAttention(nn.Module):
         kv = self.kv_proj(x).view(B, T, 2, self.n_kv_heads, self.head_dim).transpose(1, 3)
         k, v = kv[..., 0, :, :], kv[..., 1, :, :]
 
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        if cos_sin is not None:
+            cos, sin = cos_sin
+            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
 
         if self.use_sdpa:
             y = F.scaled_dot_product_attention(
