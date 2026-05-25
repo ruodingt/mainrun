@@ -246,6 +246,7 @@ class Trainer:
         ptr = step = 0
         val_loss = 0.0
         t0 = time.time()
+        total_compute_time = 0.0  # cumulative compute-only time (excludes data load + eval)
 
         for epoch in range(1, args.fixed.epochs + 1):
             for _ in tqdm(range(1, self.batches + 1), desc=f"Epoch {epoch}/{args.fixed.epochs}",
@@ -274,12 +275,13 @@ class Trainer:
                     torch.cuda.synchronize()
                 t1 = time.time()
 
-                step_time   = t1 - step_start
-                data_time   = t_data - step_start
+                step_time    = t1 - step_start
+                data_time    = t_data - step_start
                 compute_time = t1 - t_data
-                elapsed     = t1 - t0
-                local_tok_s = tokens_per_step / step_time if step_time > 0 else 0.0
-                avg_tok_s   = (step * tokens_per_step) / elapsed if elapsed > 0 else 0.0
+                elapsed      = t1 - t0
+                total_compute_time += compute_time
+                local_tok_s = tokens_per_step / compute_time if compute_time > 0 else 0.0
+                avg_tok_s   = (step * tokens_per_step) / total_compute_time if total_compute_time > 0 else 0.0
 
                 if torch.cuda.is_available():
                     alloc_gb     = torch.cuda.memory_allocated() / 1e9

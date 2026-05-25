@@ -125,8 +125,13 @@ class HybridLM(nn.Module):
         if not self.hp.arch.tie_weights:
             nn.init.normal_(self.head.weight, mean=0.0, std=0.02)
         for blk in self.blocks:
-            nn.init.normal_(blk.mlp.net[0].weight, mean=0.0, std=0.02)
-            nn.init.normal_(blk.mlp.net[2].weight, mean=0.0, std=exit_std)
+            if self.hp.arch.mlp_act == "swiglu":
+                nn.init.normal_(blk.mlp.up.weight,   mean=0.0, std=0.02)
+                nn.init.normal_(blk.mlp.gate.weight,  mean=0.0, std=0.02)
+                nn.init.normal_(blk.mlp.down.weight,  mean=0.0, std=exit_std)
+            else:
+                nn.init.normal_(blk.mlp.net[0].weight, mean=0.0, std=0.02)
+                nn.init.normal_(blk.mlp.net[2].weight, mean=0.0, std=exit_std)
             if blk.layer_type == "A":
                 nn.init.normal_(blk.mixer.q_proj.weight, mean=0.0, std=0.02)
                 nn.init.normal_(blk.mixer.kv_proj.weight, mean=0.0, std=0.02)
@@ -143,8 +148,13 @@ class HybridLM(nn.Module):
         for blk in self.blocks:
             d = self.cfg.d_model
             s = 3 ** 0.5 * d ** -0.5
-            nn.init.uniform_(blk.mlp.net[0].weight, -s * 0.4, s * 0.4)
-            nn.init.zeros_(blk.mlp.net[2].weight)
+            if self.hp.arch.mlp_act == "swiglu":
+                nn.init.uniform_(blk.mlp.up.weight,   -s * 0.4, s * 0.4)
+                nn.init.uniform_(blk.mlp.gate.weight,  -s * 0.4, s * 0.4)
+                nn.init.zeros_(blk.mlp.down.weight)
+            else:
+                nn.init.uniform_(blk.mlp.net[0].weight, -s * 0.4, s * 0.4)
+                nn.init.zeros_(blk.mlp.net[2].weight)
             if blk.layer_type == "A":
                 nn.init.uniform_(blk.mixer.q_proj.weight, -s, s)
                 nn.init.uniform_(blk.mixer.kv_proj.weight, -s, s)

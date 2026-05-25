@@ -85,13 +85,24 @@ class MLP(nn.Module):
     """
     def __init__(self, cfg):
         super().__init__()
-        _actv = {'relu_sq': ReLUSquared(), 'gelu': nn.GELU()}
-        self.net = nn.Sequential(
-            nn.Linear(cfg.d_model, 4 * cfg.d_model),
-            _actv[cfg.mlp_act],
-            nn.Linear(4 * cfg.d_model, cfg.d_model),
-            nn.Dropout(cfg.dropout),
-        )
+        self.mlp_act = cfg.mlp_act
+        self.drop = nn.Dropout(cfg.dropout)
+        if cfg.mlp_act == "swiglu":
+            # hidden = 8d/3 rounded to nearest multiple of 64 — iso-param vs 2-matrix 4d MLP
+            hidden = round(8 * cfg.d_model / 3 / 64) * 64
+            self.up   = nn.Linear(cfg.d_model, hidden, bias=False)
+            self.gate = nn.Linear(cfg.d_model, hidden, bias=False)
+            self.down = nn.Linear(hidden, cfg.d_model, bias=False)
+        else:
+            _actv = {'relu_sq': ReLUSquared(), 'gelu': nn.GELU()}
+            self.net = nn.Sequential(
+                nn.Linear(cfg.d_model, 4 * cfg.d_model),
+                _actv[cfg.mlp_act],
+                nn.Linear(4 * cfg.d_model, cfg.d_model),
+                nn.Dropout(cfg.dropout),
+            )
 
     def forward(self, x):
+        if self.mlp_act == "swiglu":
+            return self.drop(self.down(F.silu(self.gate(x)) * self.up(x)))
         return self.net(x)

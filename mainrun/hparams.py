@@ -56,7 +56,7 @@ class ModelArchHparams:
     tie_weights: bool = True        # tie lm_head to token_emb
     norm_emb: bool = False          # RMSNorm after embedding; required when token_emb std=0.8
     logit_softcap: float = 15.0     # tanh softcap on logits; 0.0 = disabled
-    mlp_act: Literal["relu_sq", "gelu"] = "relu_sq"
+    mlp_act: Literal["relu_sq", "gelu", "swiglu"] = "gelu"
 
     @property
     def n_layer(self) -> int:
