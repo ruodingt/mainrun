@@ -335,7 +335,9 @@ class Trainer:
         expt_util.save_run_results(self.run_dir, val_loss, time.time() - t0,
                                    avg_tok_s=avg_tok_s, total_params=self.model_params)
 
-        # Archive a copy of the log into the run dir for experiment record-keeping.
+        if self.args.runtime.save_weights:
+            torch.save(self.model.state_dict(), self.run_dir / "model.pt")
+
         import shutil
         shutil.copy(self.args.runtime.log_file, self.run_dir / "log.txt")
 

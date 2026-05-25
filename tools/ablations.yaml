@@ -276,3 +276,34 @@ groups:
         delta:
           use_token_anchor: true
           logit_softcap: 15.0
+
+  # ----------------------------------------------------------
+  - name: group4
+    desc: "Architecture scale: best config (swiglu+tie+rope+muon+wsd) on larger arch"
+    group_base:
+      optimizer_type: muon_adamw
+      pos_emb: rope
+      lr_schedule: wsd
+      warmup_frac: 0.05
+      min_lr_frac: 0.05
+      mlp_act: swiglu
+      tie_weights: true
+    experiments:
+      - name: g4_00_base
+        desc: "Group4 base: best config, train_old scale (6L×512d×vocab16k)"
+
+      - name: g4_01_8k
+        desc: "vocab 16k → 8k (keep 6L×512d)"
+        delta:
+          vocab_size: 8192
+
+      - name: g4_02_12A
+        desc: "6 layers → 12 layers (keep 512d×vocab16k)"
+        delta:
+          layer_pattern: AAAAAAAAAAAA
+
+      - name: g4_03_8k_12A
+        desc: "vocab 8k + 12 layers (keep 512d)"
+        delta:
+          vocab_size: 8192
+          layer_pattern: AAAAAAAAAAAA

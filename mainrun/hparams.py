@@ -99,6 +99,7 @@ class RuntimeHparams:
     experiments_dir: str = "./experiments"
     log_file: str = "./logs/mainrun.log"
     use_tqdm: bool = True
+    save_weights: bool = False
 
 
 @dataclass
