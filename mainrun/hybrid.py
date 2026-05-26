@@ -40,16 +40,21 @@ class HybridBlock(nn.Module):
             self.mixer_scale = nn.Parameter(torch.zeros(1))
             self.mlp_scale = nn.Parameter(torch.zeros(1))
 
-    def forward(self, x: torch.Tensor, cos_sin) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cos_sin, x0: torch.Tensor | None = None,
+                v_prev: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
         h = self.ln1(x)
-        mix = self.mixer(h, cos_sin) if self.layer_type == "A" else self.mixer(h)
+        if self.layer_type == "A":
+            mix, v_carry = self.mixer(h, cos_sin, x0=x0, v_prev=v_prev)
+        else:
+            mix = self.mixer(h)
+            v_carry = None
         if self.use_rezero:
             x = x + self.mixer_scale * mix
             x = x + self.mlp_scale * self.mlp(self.ln2(x))
         else:
             x = x + mix
             x = x + self.mlp(self.ln2(x))
-        return x
+        return x, v_carry
 
 
 class HybridLM(nn.Module):
@@ -72,6 +77,9 @@ class HybridLM(nn.Module):
             n_q_head=hp.attention.n_q_head,
             n_kv_heads=hp.attention.n_kv_heads,
             use_fa2=hp.runtime.use_fa2,
+            use_value_residual=hp.attention.use_value_residual,
+            use_value_residual_x0=hp.attention.use_value_residual_x0,
+            use_value_carry=hp.attention.use_value_carry,
             # mamba
             d_inner=d_inner,
             n_heads=d_inner // hp.mamba.d_head,
@@ -177,11 +185,12 @@ class HybridLM(nn.Module):
             # that likely explains any loss delta between the two baselines.
             x = x + self.pos_emb[:, :T]
             cos_sin = None
+        v_carry = None
         for i, blk in enumerate(self.blocks):
             if self.hp.arch.use_token_anchor:
                 r = self.resid_lambdas[i] if self.hp.arch.use_resid_scale else 1.0
                 x = r * x + self.x0_lambdas[i] * x0
-            x = blk(x, cos_sin)
+            x, v_carry = blk(x, cos_sin, x0=x0, v_prev=v_carry)
         x = self.ln_f(x)
 
         if self.hp.runtime.use_fused_ce and targets is not None and torch.is_grad_enabled():

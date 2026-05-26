@@ -307,3 +307,347 @@ groups:
         delta:
           vocab_size: 8192
           layer_pattern: AAAAAAAAAAAA
+
+  # ----------------------------------------------------------
+  - name: group5
+    desc: "Iso-param arch search within ~30M params (16k vocab, head_dim=64 throughout)"
+    group_base:
+      optimizer_type: muon_adamw
+      pos_emb: rope
+      lr_schedule: wsd
+      warmup_frac: 0.05
+      min_lr_frac: 0.05
+      mlp_act: swiglu
+      tie_weights: true
+    experiments:
+      - name: g5_00_base
+        desc: "Group5 base: best config 6L×512d×16k (26.8M) — reuse g4_00_base result"
+        skip: auto
+
+      - name: g5_01_8L_448
+        desc: "8L×448d×16k (26.4M) — wider than 384, deeper than 512"
+        delta:
+          layer_pattern: AAAAAAAA
+          d_model: 448
+          n_q_head: 7
+          n_kv_heads: 7
+
+      - name: g5_02_9L_448
+        desc: "9L×448d×16k (28.8M) — one more layer"
+        delta:
+          layer_pattern: AAAAAAAAA
+          d_model: 448
+          n_q_head: 7
+          n_kv_heads: 7
+
+      - name: g5_03_12L_384
+        desc: "12L×384d×16k (27.4M) — deeper narrow"
+        delta:
+          layer_pattern: AAAAAAAAAAAA
+          d_model: 384
+          n_q_head: 6
+          n_kv_heads: 6
+
+      - name: g5_04_13L_384
+        desc: "13L×384d×16k (29.0M) — deepest narrow"
+        delta:
+          layer_pattern: AAAAAAAAAAAAA
+          d_model: 384
+          n_q_head: 6
+          n_kv_heads: 6
+
+      - name: g5_05_5L_576
+        desc: "5L×576d×16k (29.1M) — shallower wider"
+        delta:
+          layer_pattern: AAAAA
+          d_model: 576
+          n_q_head: 9
+          n_kv_heads: 9
+
+      - name: g5_06_4L_640
+        desc: "4L×640d×16k (29.9M) — shallowest widest"
+        delta:
+          layer_pattern: AAAA
+          d_model: 640
+          n_q_head: 10
+          n_kv_heads: 10
+
+  # ----------------------------------------------------------
+  - name: group6
+    desc: "Arch search up to 40M: deeper 384d MHA, 320d ultra-deep, GQA-2 for depth budget"
+    group_base:
+      optimizer_type: muon_adamw
+      pos_emb: rope
+      lr_schedule: wsd
+      warmup_frac: 0.05
+      min_lr_frac: 0.05
+      mlp_act: swiglu
+      tie_weights: true
+    experiments:
+      - name: g6_00_base
+        desc: "Group6 base: best config 12L×384d×16k MHA (27.4M) — reuse g5_03"
+        skip: auto
+
+      # 384d MHA: push depth further (40M budget)
+      - name: g6_01_14L_384
+        desc: "14L×384d MHA (30.9M)"
+        delta:
+          layer_pattern: AAAAAAAAAAAAAA
+          d_model: 384
+          n_q_head: 6
+          n_kv_heads: 6
+
+      - name: g6_02_16L_384
+        desc: "16L×384d MHA (34.5M)"
+        delta:
+          layer_pattern: AAAAAAAAAAAAAAAA
+          d_model: 384
+          n_q_head: 6
+          n_kv_heads: 6
+
+      - name: g6_03_18L_384
+        desc: "18L×384d MHA (38.0M)"
+        delta:
+          layer_pattern: AAAAAAAAAAAAAAAAAA
+          d_model: 384
+          n_q_head: 6
+          n_kv_heads: 6
+
+      - name: g6_04_19L_384
+        desc: "19L×384d MHA (39.8M)"
+        delta:
+          layer_pattern: AAAAAAAAAAAAAAAAAAA
+          d_model: 384
+          n_q_head: 6
+          n_kv_heads: 6
+
+      # 320d MHA: narrower + deeper (same budget range)
+      - name: g6_05_20L_320
+        desc: "20L×320d MHA (29.7M)"
+        delta:
+          layer_pattern: AAAAAAAAAAAAAAAAAAAA
+          d_model: 320
+          n_q_head: 5
+          n_kv_heads: 5
+
+      - name: g6_06_24L_320
+        desc: "24L×320d MHA (34.6M)"
+        delta:
+          layer_pattern: AAAAAAAAAAAAAAAAAAAAAAAA
+          d_model: 320
+          n_q_head: 5
+          n_kv_heads: 5
+
+      - name: g6_07_28L_320
+        desc: "28L×320d MHA (39.5M)"
+        delta:
+          layer_pattern: AAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          d_model: 320
+          n_q_head: 5
+          n_kv_heads: 5
+
+      # 384d GQA-2: KV savings → more depth at same param budget
+      - name: g6_08_16L_384_gqa2
+        desc: "16L×384d GQA-2 (31.3M) — iso-param vs 14L MHA, +2 layers"
+        delta:
+          layer_pattern: AAAAAAAAAAAAAAAA
+          d_model: 384
+          n_q_head: 6
+          n_kv_heads: 2
+
+      - name: g6_09_21L_384_gqa2
+        desc: "21L×384d GQA-2 (39.2M) — deepest possible at 40M with GQA-2"
+        delta:
+          layer_pattern: AAAAAAAAAAAAAAAAAAAAA
+          d_model: 384
+          n_q_head: 6
+          n_kv_heads: 2
+
+  # ----------------------------------------------------------
+  - name: group7
+    desc: "256d ultra-deep: does narrower+deeper trend continue past 320d?"
+    group_base:
+      optimizer_type: muon_adamw
+      pos_emb: rope
+      lr_schedule: wsd
+      warmup_frac: 0.05
+      min_lr_frac: 0.05
+      mlp_act: swiglu
+      tie_weights: true
+    experiments:
+      - name: g7_01_28L_256
+        desc: "28L×256d MHA (26.1M)"
+        delta:
+          layer_pattern: AAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          d_model: 256
+          n_q_head: 4
+          n_kv_heads: 4
+
+      - name: g7_02_32L_256
+        desc: "32L×256d MHA (29.3M)"
+        delta:
+          layer_pattern: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          d_model: 256
+          n_q_head: 4
+          n_kv_heads: 4
+
+      - name: g7_03_36L_256
+        desc: "36L×256d MHA (32.4M)"
+        delta:
+          layer_pattern: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          d_model: 256
+          n_q_head: 4
+          n_kv_heads: 4
+
+      - name: g7_04_40L_256
+        desc: "40L×256d MHA (35.6M)"
+        delta:
+          layer_pattern: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          d_model: 256
+          n_q_head: 4
+          n_kv_heads: 4
+
+      - name: g7_05_44L_256
+        desc: "44L×256d MHA (38.7M)"
+        delta:
+          layer_pattern: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          d_model: 256
+          n_q_head: 4
+          n_kv_heads: 4
+
+  # ----------------------------------------------------------
+  - name: group8
+    desc: "Depth-dependent tricks on best arch (28L×256d): token_anchor, softcap, resid_scale"
+    group_base:
+      optimizer_type: muon_adamw
+      pos_emb: rope
+      lr_schedule: wsd
+      warmup_frac: 0.05
+      min_lr_frac: 0.05
+      mlp_act: swiglu
+      tie_weights: true
+      layer_pattern: AAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      d_model: 256
+      n_q_head: 4
+      n_kv_heads: 4
+    experiments:
+      - name: g8_00_base
+        desc: "Group8 base: 28L×256d (26.6M) — reuse g7_01 result"
+        skip: auto
+
+      - name: g8_01_anchor
+        desc: "+token_anchor"
+        delta:
+          use_token_anchor: true
+
+      - name: g8_02_softcap
+        desc: "+logit_softcap=15"
+        delta:
+          logit_softcap: 15.0
+
+      - name: g8_03_anchor_softcap
+        desc: "+token_anchor +softcap"
+        delta:
+          use_token_anchor: true
+          logit_softcap: 15.0
+
+      - name: g8_04_anchor_scale
+        desc: "+token_anchor +resid_scale"
+        delta:
+          use_token_anchor: true
+          use_resid_scale: true
+
+      - name: g8_05_all
+        desc: "+token_anchor +resid_scale +softcap"
+        delta:
+          use_token_anchor: true
+          use_resid_scale: true
+          logit_softcap: 15.0
+
+      - name: g8_06_anchor_rezero
+        desc: "+token_anchor +rezero"
+        delta:
+          use_token_anchor: true
+          use_rezero: true
+
+      - name: g8_07_rezero
+        desc: "+rezero only"
+        delta:
+          use_rezero: true
+
+  # ----------------------------------------------------------
+  - name: group9
+    desc: "Value Residual on 28L×256d: V = Wv(x) + x (zero extra params)"
+    group_base:
+      optimizer_type: muon_adamw
+      pos_emb: rope
+      lr_schedule: wsd
+      warmup_frac: 0.05
+      min_lr_frac: 0.05
+      mlp_act: swiglu
+      tie_weights: true
+      layer_pattern: AAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      d_model: 256
+      n_q_head: 4
+      n_kv_heads: 4
+    experiments:
+      - name: g9_00_base
+        desc: "Group9 base: 28L×256d — reuse g7_01 result"
+        skip: auto
+
+      - name: g9_01_value_res
+        desc: "Value residual only"
+        delta:
+          use_value_residual: true
+
+      - name: g9_02_value_res_anchor
+        desc: "Value residual + token_anchor"
+        delta:
+          use_value_residual: true
+          use_token_anchor: true
+
+      - name: g9_03_value_res_softcap
+        desc: "Value residual + logit_softcap"
+        delta:
+          use_value_residual: true
+          logit_softcap: 15.0
+
+      - name: g9_04_value_res_all
+        desc: "Value residual(x) + token_anchor + softcap"
+        delta:
+          use_value_residual: true
+          use_token_anchor: true
+          logit_softcap: 15.0
+
+      - name: g9_05_value_res_x0
+        desc: "Value residual x₀ (original embedding) only"
+        delta:
+          use_value_residual_x0: true
+
+      - name: g9_06_value_res_x0_anchor
+        desc: "Value residual x₀ + token_anchor"
+        delta:
+          use_value_residual_x0: true
+          use_token_anchor: true
+
+      - name: g9_07_both_res
+        desc: "Value residual x + x₀ combined"
+        delta:
+          use_value_residual: true
+          use_value_residual_x0: true
+
+      - name: g9_08_value_carry
+        desc: "Value carry: v_l = Wv(x) + λ*v_{l-1}, λ init=0"
+        delta:
+          use_value_carry: true
+
+      - name: g9_09_value_carry_anchor
+        desc: "Value carry + token_anchor"
+        delta:
+          use_value_carry: true
+          use_token_anchor: true
+
+      - name: g9_10_anchor_only
+        desc: "token_anchor only — reference within group9"
+        delta:
+          use_token_anchor: true

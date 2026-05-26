@@ -35,6 +35,14 @@ class CausalSelfAttention(nn.Module):
         self.n_kv_heads = getattr(cfg, "n_kv_heads", cfg.n_q_head)
         self.use_sdpa = getattr(cfg, "use_fa2", True)
         self.dropout_p = cfg.dropout
+        self.use_value_residual = getattr(cfg, "use_value_residual", False)
+        self.use_value_residual_x0 = getattr(cfg, "use_value_residual_x0", False)
+        self.use_value_carry = getattr(cfg, "use_value_carry", False)
+        if self.use_value_residual or self.use_value_residual_x0:
+            assert self.n_kv_heads * self.head_dim == cfg.d_model, \
+                "use_value_residual requires n_kv_heads * head_dim == d_model (MHA)"
+        if self.use_value_carry:
+            self.v_lambda = nn.Parameter(torch.zeros(1))
 
         self.q_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.kv_proj = nn.Linear(cfg.d_model, 2 * self.n_kv_heads * self.head_dim, bias=False)
@@ -47,7 +55,8 @@ class CausalSelfAttention(nn.Module):
             tril = torch.tril(torch.ones(cfg.block_size, cfg.block_size, dtype=torch.bool))
             self.register_buffer("tril", tril, persistent=False)
 
-    def forward(self, x: torch.Tensor, cos_sin) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cos_sin, x0: torch.Tensor | None = None,
+                v_prev: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
         B, T, C = x.size()
         # contiguous() after transpose: fixes stride layout before RoPE or SDPA.
         # Without it, torch.compile generates FA2 backward kernels assuming transposed strides,
@@ -60,6 +69,20 @@ class CausalSelfAttention(nn.Module):
             cos, sin = cos_sin
             q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
 
+        if self.use_value_residual:
+            v = v + x.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2).contiguous()
+        if self.use_value_residual_x0 and x0 is not None:
+            v = v + x0.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2).contiguous()
+        if self.use_value_carry and v_prev is not None:
+            v = v + self.v_lambda * v_prev
+
+        v_out = v  # save before GQA expand, same shape as v_prev next layer
+
+        if self.n_q_head != self.n_kv_heads:
+            groups = self.n_q_head // self.n_kv_heads
+            k = k.repeat_interleave(groups, dim=1)
+            v = v.repeat_interleave(groups, dim=1)
+
         if self.use_sdpa:
             y = F.scaled_dot_product_attention(
                 q, k, v,
@@ -68,10 +91,6 @@ class CausalSelfAttention(nn.Module):
                 is_causal=True,
             )
         else:
-            if self.n_q_head != self.n_kv_heads:
-                num_queries_per_kv = self.n_q_head // self.n_kv_heads
-                k = k.repeat_interleave(num_queries_per_kv, dim=1)
-                v = v.repeat_interleave(num_queries_per_kv, dim=1)
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
             att = att.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
             att = F.softmax(att, dim=-1)
@@ -79,7 +98,8 @@ class CausalSelfAttention(nn.Module):
             y = att @ v
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.resid_drop(self.proj(y))
+        v_carry = v_out if self.use_value_carry else None
+        return self.resid_drop(self.proj(y)), v_carry
 
 
 class MLP(nn.Module):

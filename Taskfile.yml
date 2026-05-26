@@ -6,7 +6,7 @@ includes:
     dir: .devcontainer
 
 vars:
-  SSH: ssh amd-container
+  SSH: ssh -T amd-container
   WORK_DIR: ~/workspace/mainrun
   PYTHON: /opt/venv/bin/python
 
@@ -53,7 +53,7 @@ tasks:
       - rsync -avz amd-container:{{.WORK_DIR}}/logs/ mainrun/logs/
 
   logs:
-    desc: Tail remote training log (stdout) and tqdm (stderr)
+    desc: Tail remote training log
     cmds:
       - '{{.SSH}} "tail -f {{.WORK_DIR}}/logs/mainrun.log"'
 
@@ -63,9 +63,9 @@ tasks:
       - '{{.SSH}} "tail -f {{.WORK_DIR}}/logs/train.err"'
 
   hypertune:
-    desc: "Launch hypertune on remote in background (usage: task hypertune -- plan|sweep|optuna)"
+    desc: "Launch hypertune (Optuna TPE) on remote in background (usage: task hypertune -- 60)"
     cmds:
-      - '{{.SSH}} "cd {{.WORK_DIR}} && nohup {{.PYTHON}} hypertune.py {{.CLI_ARGS}} > logs/hypertune.out 2>logs/hypertune.err </dev/null & disown"'
+      - '{{.SSH}} "cd {{.WORK_DIR}} && nohup {{.PYTHON}} -u hypertune.py {{.CLI_ARGS}} > logs/hypertune.out 2>logs/hypertune.err </dev/null & disown"'
 
   hypertune-finish:
     desc: Sync results and checkpoint after hypertune completes
@@ -73,27 +73,28 @@ tasks:
       - task: sync
       - task: checkpoint
 
-  ablation:
-    desc: "Run ablation group on remote in background (usage: task ablation -- group1)"
+  hypertune-logs:
+    desc: Check hypertune progress on remote
+    cmds:
+      - '{{.SSH}} "ls -lt {{.WORK_DIR}}/logs/hypertune_*.log 2>/dev/null | head -20"'
+      - '{{.SSH}} "tail -3 {{.WORK_DIR}}/logs/hypertune_*.log 2>/dev/null"'
+
+  ablation-remote:
+    desc: "Run ablation group on remote in background (usage: task ablation-remote -- group1)"
     deps: [checkpoint]
     cmds:
+      - rsync -avz tools/ablations.yaml amd-container:{{.WORK_DIR}}/tools/
       - '{{.SSH}} "cd {{.WORK_DIR}} && nohup {{.PYTHON}} -u ablation.py --group {{.CLI_ARGS}} > logs/ablation.out 2>logs/ablation.err </dev/null & disown"'
-
-  sync-ablation:
-    desc: "Sync ablation results and logs from remote (usage: task sync-ablation -- group1)"
-    cmds:
-      - .venv/bin/python tools/sync_ablation.py {{.CLI_ARGS}}
 
   ablation-logs:
     desc: "Tail ablation progress on remote"
     cmds:
       - '{{.SSH}} "tail -f {{.WORK_DIR}}/logs/ablation.out"'
 
-  hypertune-logs:
-    desc: Check hypertune progress on remote
+  sync-ablation:
+    desc: "Sync ablation results and logs from remote (usage: task sync-ablation -- group1)"
     cmds:
-      - '{{.SSH}} "ls -lt {{.WORK_DIR}}/logs/hypertune_*.log 2>/dev/null | head -20"'
-      - '{{.SSH}} "tail -3 {{.WORK_DIR}}/logs/hypertune_*.log 2>/dev/null"'
+      - .venv/bin/python tools/sync_ablation.py {{.CLI_ARGS}}
 
   submit:
     deps: [checkpoint]

@@ -22,6 +22,9 @@ from typing import Literal
 class AttentionHparams:
     n_q_head: int = 6
     n_kv_heads: int = 1    # 1=MQA, n_q_head=MHA, anything between=GQA
+    use_value_residual: bool = False     # add layer-input x to V before attention
+    use_value_residual_x0: bool = False  # add original token embedding x₀ to V
+    use_value_carry: bool = False    # v_l = Wv(x) + λ * v_{l-1} (learnable λ, init=0)
 
 
 @dataclass
