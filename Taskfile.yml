@@ -62,7 +62,7 @@ tasks:
     cmds:
       - '{{.SSH}} "tail -f {{.WORK_DIR}}/logs/train.err"'
 
-  hypertune:
+  hypertune-remote:
     desc: "Launch hypertune (Optuna TPE) on remote in background (usage: task hypertune -- 60)"
     cmds:
       - '{{.SSH}} "cd {{.WORK_DIR}} && nohup {{.PYTHON}} -u hypertune.py {{.CLI_ARGS}} > logs/hypertune.out 2>logs/hypertune.err </dev/null & disown"'
@@ -74,10 +74,9 @@ tasks:
       - task: checkpoint
 
   hypertune-logs:
-    desc: Check hypertune progress on remote
+    desc: Tail hypertune progress on remote
     cmds:
-      - '{{.SSH}} "ls -lt {{.WORK_DIR}}/logs/hypertune_*.log 2>/dev/null | head -20"'
-      - '{{.SSH}} "tail -3 {{.WORK_DIR}}/logs/hypertune_*.log 2>/dev/null"'
+      - '{{.SSH}} "tail -f {{.WORK_DIR}}/logs/hypertune.out"'
 
   ablation-remote:
     desc: "Run ablation group on remote in background (usage: task ablation-remote -- group1)"

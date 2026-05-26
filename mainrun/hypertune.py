@@ -1,8 +1,8 @@
 """
 Optuna TPE hyperparameter search for train_hybrid.py.
 
-Base config: best ablation findings (12L × 384d × vocab8192, swiglu, tie_weights,
-             rope, muon+adamw, WSD, gpt2 init).
+Base config: best arch from ablation (28L×256d×16k, swiglu, tie, rope,
+             muon+adamw, WSD, gpt2 init, token_anchor).
 
 Search space: LR and schedule params only.
 
@@ -14,6 +14,7 @@ import json
 import sys
 import time
 from pathlib import Path
+import optuna
 
 # ---------------------------------------------------------------------------
 # Config
@@ -24,25 +25,24 @@ OPTUNA_N_TRIALS = 60
 EXPT_DIR = "./experiments/hypertune"
 
 # Fixed overrides applied to every trial — the best config from ablation study.
-# group2 winner: muon+rope+wsd+swiglu+tie on train_old arch (6L×512d×16k)
-# group4 confirmed: 12L and 8k vocab both hurt; 6L×512d×16k is optimal arch.
+# group5-9: 28L×256d×16k + token_anchor = 1.1696 (best overall)
 BASE_OVERRIDES: dict = {
-    # Architecture (train_old scale — group4 confirmed no benefit from scaling)
-    "layer_pattern": "AAAAAA",
-    "vocab_size":    16000,
-    "d_model":       512,
-    "n_q_head":      8,
-    "n_kv_heads":    8,        # MHA; MQA tested in g2_04, slightly worse
-    "norm":          "layernorm",
-    "use_token_anchor": False, # neutral in group3, keep it off
-    "logit_softcap": 0.0,      # neutral in group3
-    # Optimizer/init findings
-    "weight_init":   "gpt2",   # muon_uniform hurts at this scale (g1_02)
-    "mlp_act":       "swiglu", # best activation (g2_09)
-    "tie_weights":   True,     # +0.02 improvement (g2_09)
-    "optimizer_type": "muon_adamw",
-    "pos_emb":       "rope",
-    "lr_schedule":   "wsd",
+    # Architecture (groups 5-7: deep-narrow wins; 28L×256d optimal within 40M)
+    "layer_pattern":    "A" * 28,
+    "vocab_size":       16000,
+    "d_model":          256,
+    "n_q_head":         4,
+    "n_kv_heads":       4,
+    # Arch tricks (group8-9: anchor helps at depth, softcap/rezero/value_res hurt)
+    "use_token_anchor": True,
+    "logit_softcap":    0.0,
+    # Optimizer/init findings (groups 1-4)
+    "weight_init":      "gpt2",
+    "mlp_act":          "swiglu",
+    "tie_weights":      True,
+    "optimizer_type":   "muon_adamw",
+    "pos_emb":          "rope",
+    "lr_schedule":      "wsd",
 }
 
 # ---------------------------------------------------------------------------
@@ -51,7 +51,7 @@ BASE_OVERRIDES: dict = {
 
 def _run_trial(overrides: dict, trial, log_file: str | None) -> float:
     """Run train_hybrid.py, report intermediate val_losses to Optuna for pruning."""
-    import optuna
+
     payload = {
         **BASE_OVERRIDES,
         **overrides,
@@ -111,6 +111,7 @@ def _objective(trial, dry_run: bool) -> float:
         "decay_frac":  trial.suggest_float("decay_frac",  0.30,  0.80),
         "warmup_frac": trial.suggest_categorical("warmup_frac", [0.02, 0.05, 0.10]),
         "min_lr_frac": trial.suggest_float("min_lr_frac", 0.01,  0.10,  log=True),
+        "dropout":     trial.suggest_float("dropout",     0.0,   0.20),
     }
     if dry_run:
         print(f"  [dry-run] trial {trial.number}: {overrides}")
@@ -153,7 +154,7 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"Optuna TPE search: {n_trials} trials ({completed} done, {remaining} remaining)")
-    print(f"Base: 6L×512d×vocab16k, swiglu, tie, rope, muon+wsd, gpt2_init")
+    print(f"Base: 28L×256d×vocab16k, swiglu, tie, rope, muon+wsd, gpt2_init, token_anchor")
     print(f"Search: muon_lr, adamw_lr, emb_lr, decay_frac, warmup_frac, min_lr_frac")
     print(f"Proxy: {ROUND1_EPOCHS} epochs  |  DB: {db_path}")
     print(f"{'='*60}\n")

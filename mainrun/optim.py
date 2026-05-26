@@ -1,7 +1,7 @@
 """
 A nice and efficient mixed AdamW/Muon Combined Optimizer.
 Usually the embeddings and scalars go into AdamW, and the matrix parameters go into Muon.
-Two versions are provided (MuonAdamW, DistMuonAdamW), for single GPU and distributed.
+Two versions are provided (MuonAdamW), for single GPU and distributed.
 
 Addapted from: https://github.com/KellerJordan/modded-nanogpt
 Further contributions from @karpathy and @chrisjmccormick.
