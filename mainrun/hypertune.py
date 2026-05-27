@@ -1,16 +1,20 @@
 """
 Optuna TPE hyperparameter search for train_hybrid.py.
 
-Base config: best arch from ablation (28L×256d×16k, swiglu, tie, rope,
-             muon+adamw, WSD, gpt2 init, token_anchor).
+Runs full 7-epoch trials — no proxy/full split, no schedule mismatch.
+Optuna's MedianPruner kills bad trials early (typically within epoch 1-2).
+Best trial results are copied to experiments/hypertune-full/ for sync_ablation.
 
-Search space: LR and schedule params only.
+New study name "hypertune_v2" — old proxy-based results are incompatible.
 
 Usage:
-  python hypertune.py [N]          # N trials (default 60, resumable)
-  python hypertune.py --dry-run    # preview sampled params without running
+  python hypertune.py [N]       # N trials (default 60, resumable)
+  python hypertune.py --dry-run # preview sampled params without running
+  python hypertune.py --force   # overwrite hypertune-full/ even if it exists
 """
 import json
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -20,23 +24,21 @@ import optuna
 # Config
 # ---------------------------------------------------------------------------
 
-ROUND1_EPOCHS = 3
-OPTUNA_N_TRIALS = 60
-EXPT_DIR = "./experiments/hypertune"
+EPOCHS          = 7
+OPTUNA_N_TRIALS = 40
+EXPT_DIR        = "./experiments/hypertune_v2"
+FULL_EXPT_DIR   = "./experiments/hypertune_v2_best"
 
-# Fixed overrides applied to every trial — the best config from ablation study.
-# group5-9: 28L×256d×16k + token_anchor = 1.1696 (best overall)
+# Best config from ablation (groups 1-9).
 BASE_OVERRIDES: dict = {
-    # Architecture (groups 5-7: deep-narrow wins; 28L×256d optimal within 40M)
     "layer_pattern":    "A" * 28,
     "vocab_size":       16000,
     "d_model":          256,
+    "norm":             "layernorm",
     "n_q_head":         4,
     "n_kv_heads":       4,
-    # Arch tricks (group8-9: anchor helps at depth, softcap/rezero/value_res hurt)
     "use_token_anchor": True,
     "logit_softcap":    0.0,
-    # Optimizer/init findings (groups 1-4)
     "weight_init":      "gpt2",
     "mlp_act":          "swiglu",
     "tie_weights":      True,
@@ -49,20 +51,22 @@ BASE_OVERRIDES: dict = {
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _run_trial(overrides: dict, trial, log_file: str | None) -> float:
-    """Run train_hybrid.py, report intermediate val_losses to Optuna for pruning."""
+def _trial_expt_dir(trial_number: int) -> str:
+    return f"{EXPT_DIR}/trial_{trial_number:03d}"
 
+
+def _run_trial(overrides: dict, trial) -> float:
+    """Run train_hybrid.py for full EPOCHS, report val_losses for pruning."""
+    expt_dir = _trial_expt_dir(trial.number)
     payload = {
         **BASE_OVERRIDES,
         **overrides,
-        "epochs": ROUND1_EPOCHS,
-        "experiments_dir": EXPT_DIR,
+        "epochs":          EPOCHS,
         "evals_per_epoch": 3,
+        "experiments_dir": expt_dir,
+        "log_file":        f"{expt_dir}/train.log",
     }
-    if log_file:
-        payload["log_file"] = log_file
 
-    import subprocess
     cmd = [sys.executable, "train_hybrid.py", json.dumps(payload)]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=None, text=True)
     lines = []
@@ -88,6 +92,49 @@ def _run_trial(overrides: dict, trial, log_file: str | None) -> float:
         if "validation_step: loss=" in line:
             return float(line.split("loss=")[1].split()[0])
     return float("inf")
+
+
+def _promote_best(study, force: bool):
+    """Copy best trial's experiment dir → hypertune-full/ for sync_ablation."""
+    full_dir = Path(FULL_EXPT_DIR)
+    if not force and list(full_dir.glob("**/results.json")):
+        print(f"[hypertune] hypertune-full/ already exists, skipping (--force to overwrite)")
+        return
+
+    best = study.best_trial
+    src = Path(_trial_expt_dir(best.number))
+    if not src.exists():
+        print(f"[hypertune] best trial dir not found: {src}")
+        return
+
+    if full_dir.exists():
+        shutil.rmtree(full_dir)
+    shutil.copytree(src, full_dir)
+    print(f"[hypertune] best trial #{best.number} (val_loss={best.value:.4f}) → {full_dir}")
+
+
+def _write_top5(study):
+    completed = [t for t in study.trials if t.state.name == "COMPLETE"]
+    top5 = sorted(completed, key=lambda t: t.value)[:5]
+    lines = [
+        "# Hypertune Top 5 Trials\n",
+        f"Base: 28L×256d×vocab16k, layernorm, swiglu, tie, rope, muon+wsd, gpt2_init, token_anchor\n",
+        f"Full {EPOCHS} epochs per trial (early-stopped by Optuna pruner)\n\n",
+        "| Rank | Trial | val_loss | muon_lr | adamw_lr | emb_lr | decay_frac | warmup_frac | min_lr_frac | dropout |\n",
+        "|------|-------|----------|---------|----------|--------|------------|-------------|-------------|----------|\n",
+    ]
+    for rank, t in enumerate(top5, 1):
+        p = t.params
+        lines.append(
+            f"| {rank} | #{t.number} | {t.value:.4f} "
+            f"| {p.get('muon_lr', '-'):.4f} | {p.get('adamw_lr', '-'):.5f} "
+            f"| {p.get('emb_lr', '-'):.4f} | {p.get('decay_frac', '-'):.2f} "
+            f"| {p.get('warmup_frac', '-')} | {p.get('min_lr_frac', '-'):.4f} "
+            f"| {p.get('dropout', '-'):.3f} |\n"
+        )
+    out = Path(EXPT_DIR) / "top5.md"
+    out.write_text("".join(lines))
+    print(f"Top 5 written to {out}")
 
 
 def _log(msg: str):
@@ -118,10 +165,7 @@ def _objective(trial, dry_run: bool) -> float:
         return 0.0
 
     _log(f"trial {trial.number:3d} start  {overrides}")
-    loss = _run_trial(
-        overrides, trial,
-        log_file=f"./logs/hypertune_{trial.number:03d}.log",
-    )
+    loss = _run_trial(overrides, trial)
     _log(f"trial {trial.number:3d} end    loss={loss:.4f}  {overrides}")
     return loss
 
@@ -130,23 +174,23 @@ def _objective(trial, dry_run: bool) -> float:
 # ---------------------------------------------------------------------------
 
 def main():
-    import optuna
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     args = sys.argv[1:]
-    dry_run = "--dry-run" in args
+    dry_run  = "--dry-run" in args
+    force    = "--force"   in args
     n_trials = next((int(a) for a in args if a.isdigit()), OPTUNA_N_TRIALS)
 
-    db_path = Path(EXPT_DIR) / "optuna.db"
+    db_path = Path(EXPT_DIR) / "optuna_v2.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     study = optuna.create_study(
-        study_name="hypertune",
+        study_name="hypertune_v2",
         storage=f"sqlite:///{db_path}",
         load_if_exists=True,
         direction="minimize",
         sampler=optuna.samplers.TPESampler(seed=1337),
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=8, n_warmup_steps=3),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=8, n_warmup_steps=6),
     )
 
     completed = len([t for t in study.trials if t.state.name == "COMPLETE"])
@@ -154,9 +198,10 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"Optuna TPE search: {n_trials} trials ({completed} done, {remaining} remaining)")
-    print(f"Base: 28L×256d×vocab16k, swiglu, tie, rope, muon+wsd, gpt2_init, token_anchor")
-    print(f"Search: muon_lr, adamw_lr, emb_lr, decay_frac, warmup_frac, min_lr_frac")
-    print(f"Proxy: {ROUND1_EPOCHS} epochs  |  DB: {db_path}")
+    print(f"Base: 28L×256d×vocab16k, layernorm, swiglu, tie, rope, muon+wsd, gpt2_init, token_anchor")
+    print(f"Search: muon_lr, adamw_lr, emb_lr, decay_frac, warmup_frac, min_lr_frac, dropout")
+    print(f"Full {EPOCHS} epochs per trial, pruner kills bad trials early")
+    print(f"DB: {db_path}")
     print(f"{'='*60}\n")
 
     if dry_run:
@@ -165,12 +210,21 @@ def main():
             _objective(trial, dry_run=True)
         return
 
-    study.optimize(lambda t: _objective(t, dry_run=False), n_trials=remaining)
+    def _progress(study, trial):
+        completed = len([t for t in study.trials if t.state.name == "COMPLETE"])
+        best = study.best_value if completed > 0 else float("inf")
+        _log(f"progress {completed:3d}/{n_trials}  best={best:.4f}")
+
+    study.optimize(lambda t: _objective(t, dry_run=False), n_trials=remaining,
+                   callbacks=[_progress])
 
     print(f"\n{'='*60}")
     print(f"Best val_loss: {study.best_value:.4f}")
     print(f"Best params:   {study.best_params}")
     print(f"{'='*60}\n")
+
+    _write_top5(study)
+    _promote_best(study, force=force)
 
 
 if __name__ == "__main__":

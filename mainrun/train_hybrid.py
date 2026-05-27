@@ -90,6 +90,9 @@ class Trainer:
         self.train_ids = self.val_ids = self.val_text = self.tok = None
         self.model = self.opt = self.scheduler = None
         self.batches = self.max_steps = self.eval_interval = 0
+        self._plateau_best: float = float("inf")
+        self._plateau_no_improve: int = 0
+        self._initial_lrs: list[float] = []
         self.model_params = 0
         # named AdamW param groups — kept as refs for TensorBoard LR logging
         self.pg_emb = self.pg_scalar = self.pg_other = None
@@ -194,7 +197,7 @@ class Trainer:
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=self.max_steps)
 
     def _build_lr_schedule(self):
-        """WSD or cosine LambdaLR — used by muon_adamw."""
+        """WSD, cosine, plateau, or sgdr LambdaLR — used by muon_adamw."""
         args = self.args
         warmup_steps = int(self.max_steps * args.optimizer.warmup_frac)
         if args.optimizer.lr_schedule == "wsd":
@@ -207,6 +210,47 @@ class Trainer:
                     return 1.0
                 progress = (step - warmup_steps - stable_steps) / max(decay_steps, 1)
                 return args.optimizer.min_lr_frac + (1 - args.optimizer.min_lr_frac) * 0.5 * (1 + math.cos(math.pi * progress))
+        elif args.optimizer.lr_schedule == "sgdr":
+            # Cosine annealing with warm restarts (SGDR, T_mult=1).
+            # T_0 = sgdr_t0_frac * (total_steps - warmup_steps); restart every T_0 post-warmup steps.
+            T0 = max(1, int((self.max_steps - warmup_steps) * args.optimizer.sgdr_t0_frac))
+            def lr_lambda(step):
+                if step < warmup_steps:
+                    return step / max(warmup_steps, 1)
+                t = (step - warmup_steps) % T0
+                cos_frac = 0.5 * (1 + math.cos(math.pi * t / T0))
+                return args.optimizer.min_lr_frac + (1 - args.optimizer.min_lr_frac) * cos_frac
+        elif args.optimizer.lr_schedule == "wsd_cycle":
+            # Repeating WSD cycles: each cycle is a full warmup→stable→cosine-decay.
+            # Cycle length = sgdr_t0_frac * total_steps (default ~3/7 ≈ 3 epochs out of 7).
+            # wsd_n_cycles controls how many cycles to run (excess steps hold at min_lr).
+            # wsd_cycle_lr_decay: max LR multiplier per cycle (1.0 = same every cycle, 0.5 = halve each time).
+            cycle_len = max(1, int(self.max_steps * args.optimizer.sgdr_t0_frac))
+            c_warmup = max(1, int(cycle_len * args.optimizer.warmup_frac))
+            c_decay  = max(1, int(cycle_len * args.optimizer.decay_frac))
+            c_stable = max(0, cycle_len - c_warmup - c_decay)
+            n_cycles = args.optimizer.wsd_n_cycles
+            lr_decay = args.optimizer.wsd_cycle_lr_decay
+            def lr_lambda(step):
+                cycle = step // cycle_len
+                if cycle >= n_cycles:
+                    return args.optimizer.min_lr_frac
+                scale = lr_decay ** cycle  # 1.0 for cycle 0, lr_decay for cycle 1, etc.
+                t = step % cycle_len
+                if t < c_warmup:
+                    return scale * t / c_warmup
+                if t < c_warmup + c_stable:
+                    return scale
+                progress = (t - c_warmup - c_stable) / c_decay
+                cos_val = 0.5 * (1 + math.cos(math.pi * progress))
+                return args.optimizer.min_lr_frac + (scale - args.optimizer.min_lr_frac) * cos_val
+        elif args.optimizer.lr_schedule == "plateau":
+            # Warmup then flat; LR reduction handled manually after each eval.
+            self._initial_lrs = [pg['lr'] for pg in self.opt.param_groups]
+            def lr_lambda(step):
+                if step < warmup_steps:
+                    return step / max(warmup_steps, 1)
+                return 1.0
         else:
             def lr_lambda(step):
                 if step < warmup_steps:
@@ -317,6 +361,31 @@ class Trainer:
                                     loss=val_loss, elapsed_time=elapsed)
                     if self.tb_writer:
                         self.tb_writer.add_scalar("Loss/val", val_loss, step)
+                    if args.optimizer.lr_schedule == "plateau" and self._initial_lrs:
+                        warmup_steps = int(self.max_steps * args.optimizer.warmup_frac)
+                        if step > warmup_steps:
+                            if val_loss < self._plateau_best - 1e-4:
+                                self._plateau_best = val_loss
+                                self._plateau_no_improve = 0
+                            else:
+                                self._plateau_no_improve += 1
+                                if self._plateau_no_improve >= args.optimizer.plateau_patience:
+                                    new_lrs = []
+                                    for pg, init_lr, base_lr in zip(
+                                        self.opt.param_groups, self._initial_lrs,
+                                        self.scheduler.base_lrs
+                                    ):
+                                        new_lr = max(base_lr * args.optimizer.plateau_factor,
+                                                     init_lr * args.optimizer.min_lr_frac)
+                                        pg['lr'] = new_lr
+                                        new_lrs.append(new_lr)
+                                    # Update scheduler base_lrs so LambdaLR(1.0) keeps new values
+                                    self.scheduler.base_lrs = new_lrs
+                                    self._plateau_no_improve = 0
+                                    self.logger.log("plateau_lr_reduction", step=step,
+                                                    max_steps=self.max_steps,
+                                                    new_lrs=new_lrs,
+                                                    elapsed_time=elapsed)
 
         if self.tb_writer:
             from torch.utils.tensorboard.summary import hparams as tb_hparams

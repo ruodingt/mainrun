@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 from collections import defaultdict
 
-from mainrun.mainrun.train import Hyperparameters
+from hparams import Hyperparameters
 
 # Safely import GPT and GPTConfig from train.py
 try:

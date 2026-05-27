@@ -20,8 +20,8 @@ from typing import Literal
 
 @dataclass
 class AttentionHparams:
-    n_q_head: int = 6
-    n_kv_heads: int = 1    # 1=MQA, n_q_head=MHA, anything between=GQA
+    n_q_head: int = 4
+    n_kv_heads: int = 4    # 1=MQA, n_q_head=MHA, anything between=GQA
     use_value_residual: bool = False     # add layer-input x to V before attention
     use_value_residual_x0: bool = False  # add original token embedding x₀ to V
     use_value_carry: bool = False    # v_l = Wv(x) + λ * v_{l-1} (learnable λ, init=0)
@@ -41,24 +41,22 @@ class MambaHparams:
 class ModelArchHparams:
     # "A"=Attention, "M"=Mamba; length defines n_layer.
     # Pure transformer: "AAAAAAAAAAAA". Jamba-ish: "MMMAMMMAMMMA". Samba: "MAMAMAMAMAMA".
-    layer_pattern: str = "A" * 12
+    layer_pattern: str = "A" * 28   # 28L×256d: best from arch search (groups 5-7)
 
-    vocab_size: int = 8192
-    d_model: int = 384
+    vocab_size: int = 16000
+    d_model: int = 256
     dropout: float = 0.1
 
     norm: Literal["rmsnorm", "layernorm"] = "rmsnorm"
     pos_emb: Literal["rope", "learned"] = "rope"
-    # use_rezero - False (default): muon_uniform init already zeros residual exits (identity-at-init).
-    # Stacking ReZero (scale init=0) on top may compound this effect. Empirically untested with muon_uniform.
     use_rezero: bool = False
-    use_token_anchor: bool = True   # per-layer learnable skip from original token embedding
+    use_token_anchor: bool = True   # depth-dependent: helps at 28L (group8), neutral at 6L (group3)
     use_resid_scale: bool = False   # per-layer residual stream scaling; requires use_token_anchor=True
-    weight_init: Literal["gpt2", "muon_uniform"] = "muon_uniform"
+    weight_init: Literal["gpt2", "muon_uniform"] = "gpt2"  # muon_uniform hurts (group1)
     tie_weights: bool = True        # tie lm_head to token_emb
-    norm_emb: bool = False          # RMSNorm after embedding; required when token_emb std=0.8
-    logit_softcap: float = 15.0     # tanh softcap on logits; 0.0 = disabled
-    mlp_act: Literal["relu_sq", "gelu", "swiglu"] = "gelu"
+    norm_emb: bool = False
+    logit_softcap: float = 0.0      # hurts at 28L (group8)
+    mlp_act: Literal["relu_sq", "gelu", "swiglu"] = "swiglu"  # best activation (group2)
 
     @property
     def n_layer(self) -> int:
@@ -76,10 +74,15 @@ class OptimizerHparams:
     sgd_lr: float = 6e-3        # SGD baseline LR (matches train_old.py)
     sgd_wd: float = 0.0         # SGD weight decay
 
-    lr_schedule: Literal["wsd", "cosine"] = "wsd"
+    lr_schedule: Literal["wsd", "cosine", "plateau", "sgdr", "wsd_cycle"] = "wsd"
     warmup_frac: float = 0.05
     decay_frac: float = 0.60    # WSD only: fraction of steps for final cosine decay
-    min_lr_frac: float = 0.05    # decay floor; 0.0 = decay all the way to zero
+    min_lr_frac: float = 0.05   # decay floor; 0.0 = decay all the way to zero
+    plateau_factor: float = 0.5    # plateau only: LR multiplier on no-improve
+    plateau_patience: int = 3      # plateau only: evals with no improvement before reducing
+    sgdr_t0_frac: float = 0.43    # SGDR/wsd_cycle: cycle length as fraction of total steps (~3/7)
+    wsd_n_cycles: int = 2         # wsd_cycle only: number of WSD cycles
+    wsd_cycle_lr_decay: float = 1.0  # wsd_cycle only: max LR multiplier per cycle (e.g. 0.5 = half each restart)
 
 
 @dataclass

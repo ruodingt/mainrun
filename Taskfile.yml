@@ -73,6 +73,12 @@ tasks:
       - task: sync
       - task: checkpoint
 
+  hypertune-results:
+    desc: Print best trial from Optuna study
+    cmds:
+      - rsync -avz tools/hypertune_results.py amd-container:{{.WORK_DIR}}/tools/
+      - '{{.SSH}} "cd {{.WORK_DIR}} && {{.PYTHON}} tools/hypertune_results.py"'
+
   hypertune-logs:
     desc: Tail hypertune progress on remote
     cmds:
@@ -93,7 +99,7 @@ tasks:
   sync-ablation:
     desc: "Sync ablation results and logs from remote (usage: task sync-ablation -- group1)"
     cmds:
-      - .venv/bin/python tools/sync_ablation.py {{.CLI_ARGS}}
+      - python tools/sync_ablation.py {{.CLI_ARGS}}
 
   submit:
     deps: [checkpoint]
