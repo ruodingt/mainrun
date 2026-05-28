@@ -12,7 +12,7 @@ import time
 
 import torch
 
-from train_hybrid import get_batch
+
 
 
 def _cuda_us(e) -> float:
@@ -32,6 +32,7 @@ def _top_overhead(key_avgs, skip=("hipDeviceSynchronize", "record_function")):
 
 
 class ProfilerMixin:
+
     # TODO：Tactical solution kto keep trainer small
     #  highly relying on Trainer right now, more decoupling needed later
     def profile(self, warmup: int = 3, steps: int = 10,
@@ -117,6 +118,7 @@ class ProfilerMixin:
 
     def _analyze_graph_breaks(self, block_size, batch_size, device):
         print("\nGraph break analysis...")
+        from train_hybrid import get_batch
         xb, yb, _ = get_batch(self.train_ids, 0, block_size, batch_size, device)
         explanation = torch._dynamo.explain(self.model)(xb, yb)
         n_graphs = len(explanation.graphs)
