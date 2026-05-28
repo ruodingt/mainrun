@@ -33,7 +33,11 @@ class HybridBlock(nn.Module):
         self.layer_type = layer_type
         self.ln1 = make_norm(cfg.d_model, cfg.norm)
         self.ln2 = make_norm(cfg.d_model, cfg.norm)
-        self.mixer = CausalSelfAttention(cfg) if layer_type == "A" else Mamba2Mixer(cfg)
+        if layer_type in ("A", "E"):
+            attn_cfg = SimpleNamespace(**vars(cfg), has_ve=(layer_type == "E"))
+            self.mixer = CausalSelfAttention(attn_cfg)
+        else:
+            self.mixer = Mamba2Mixer(cfg)
         self.mlp = MLP(cfg)
         self.use_rezero = cfg.use_rezero
         if self.use_rezero:
@@ -41,10 +45,11 @@ class HybridBlock(nn.Module):
             self.mlp_scale = nn.Parameter(torch.zeros(1))
 
     def forward(self, x: torch.Tensor, cos_sin, x0: torch.Tensor | None = None,
-                v_prev: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
+                v_prev: torch.Tensor | None = None,
+                ve: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
         h = self.ln1(x)
-        if self.layer_type == "A":
-            mix, v_carry = self.mixer(h, cos_sin, x0=x0, v_prev=v_prev)
+        if self.layer_type in ("A", "E"):
+            mix, v_carry = self.mixer(h, cos_sin, x0=x0, v_prev=v_prev, ve=ve)
         else:
             mix = self.mixer(h)
             v_carry = None
@@ -60,8 +65,8 @@ class HybridBlock(nn.Module):
 class HybridLM(nn.Module):
     def __init__(self, hp: Hyperparameters, vocab_size: int):
         super().__init__()
-        assert set(hp.arch.layer_pattern) <= {"M", "A"}, \
-            f"layer_pattern must be M/A only: {hp.arch.layer_pattern!r}"
+        assert set(hp.arch.layer_pattern) <= {"M", "A", "E"}, \
+            f"layer_pattern must be M/A/E only: {hp.arch.layer_pattern!r}"
 
         d_inner = hp.mamba.expand * hp.arch.d_model
         # Flat namespace for submodules (CausalSelfAttention, Mamba2Mixer, MLP).
@@ -73,13 +78,16 @@ class HybridLM(nn.Module):
             norm=hp.arch.norm,
             use_rezero=hp.arch.use_rezero,
             mlp_act=hp.arch.mlp_act,
+            mlp_expand=hp.arch.mlp_expand,
             # attention
             n_q_head=hp.attention.n_q_head,
             n_kv_heads=hp.attention.n_kv_heads,
+            separate_kv=hp.attention.separate_kv,
             use_fa2=hp.runtime.use_fa2,
             use_value_residual=hp.attention.use_value_residual,
             use_value_residual_x0=hp.attention.use_value_residual_x0,
             use_value_carry=hp.attention.use_value_carry,
+            ve_gate_channels=hp.attention.ve_gate_channels,
             # mamba
             d_inner=d_inner,
             n_heads=d_inner // hp.mamba.d_head,
@@ -101,6 +109,12 @@ class HybridLM(nn.Module):
 
         self.token_emb = nn.Embedding(vocab_size, cfg.d_model)
         self.drop = nn.Dropout(cfg.dropout)
+        kv_dim = hp.attention.n_kv_heads * (cfg.d_model // hp.attention.n_q_head)
+        self.value_embeds = nn.ModuleDict({
+            str(i): nn.Embedding(vocab_size, kv_dim)
+            for i, t in enumerate(hp.arch.layer_pattern) if t == "E"
+        })
+        self._has_ve = [t == "E" for t in hp.arch.layer_pattern]  # pre-computed, avoids dict lookup in forward
 
         if hp.arch.pos_emb == "rope":
             head_dim = cfg.d_model // cfg.n_q_head
@@ -130,6 +144,8 @@ class HybridLM(nn.Module):
     def _init_gpt2(self):
         exit_std = 0.02 if self.hp.arch.use_rezero else 0.0
         nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
+        for ve in self.value_embeds.values():
+            nn.init.normal_(ve.weight, mean=0.0, std=0.02)
         if not self.hp.arch.tie_weights:
             nn.init.normal_(self.head.weight, mean=0.0, std=0.02)
         for blk in self.blocks:
@@ -140,10 +156,16 @@ class HybridLM(nn.Module):
             else:
                 nn.init.normal_(blk.mlp.net[0].weight, mean=0.0, std=0.02)
                 nn.init.normal_(blk.mlp.net[2].weight, mean=0.0, std=exit_std)
-            if blk.layer_type == "A":
+            if blk.layer_type in ("A", "E"):
                 nn.init.normal_(blk.mixer.q_proj.weight, mean=0.0, std=0.02)
-                nn.init.normal_(blk.mixer.kv_proj.weight, mean=0.0, std=0.02)
+                if blk.mixer.separate_kv:
+                    nn.init.normal_(blk.mixer.k_proj.weight, mean=0.0, std=0.02)
+                    nn.init.normal_(blk.mixer.v_proj.weight, mean=0.0, std=0.02)
+                else:
+                    nn.init.normal_(blk.mixer.kv_proj.weight, mean=0.0, std=0.02)
                 nn.init.normal_(blk.mixer.proj.weight, mean=0.0, std=exit_std)
+                if blk.mixer.has_ve:
+                    nn.init.uniform_(blk.mixer.ve_gate.weight, 0.0, 0.02)
             else:
                 nn.init.normal_(blk.mixer.in_proj.weight, mean=0.0, std=0.02)
                 nn.init.normal_(blk.mixer.out_proj.weight, mean=0.0, std=exit_std)
@@ -151,6 +173,8 @@ class HybridLM(nn.Module):
     @torch.no_grad()
     def _init_muon_uniform(self):
         nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
+        for ve in self.value_embeds.values():
+            nn.init.normal_(ve.weight, mean=0.0, std=0.02)
         if not self.hp.arch.tie_weights:
             nn.init.normal_(self.head.weight, mean=0.0, std=0.001)
         for blk in self.blocks:
@@ -163,10 +187,16 @@ class HybridLM(nn.Module):
             else:
                 nn.init.uniform_(blk.mlp.net[0].weight, -s * 0.4, s * 0.4)
                 nn.init.zeros_(blk.mlp.net[2].weight)
-            if blk.layer_type == "A":
+            if blk.layer_type in ("A", "E"):
                 nn.init.uniform_(blk.mixer.q_proj.weight, -s, s)
-                nn.init.uniform_(blk.mixer.kv_proj.weight, -s, s)
+                if blk.mixer.separate_kv:
+                    nn.init.uniform_(blk.mixer.k_proj.weight, -s, s)
+                    nn.init.uniform_(blk.mixer.v_proj.weight, -s, s)
+                else:
+                    nn.init.uniform_(blk.mixer.kv_proj.weight, -s, s)
                 nn.init.zeros_(blk.mixer.proj.weight)
+                if blk.mixer.has_ve:
+                    nn.init.uniform_(blk.mixer.ve_gate.weight, 0.0, 0.02)
             else:
                 nn.init.uniform_(blk.mixer.in_proj.weight, -s, s)
                 nn.init.zeros_(blk.mixer.out_proj.weight)
@@ -190,7 +220,8 @@ class HybridLM(nn.Module):
             if self.hp.arch.use_token_anchor:
                 r = self.resid_lambdas[i] if self.hp.arch.use_resid_scale else 1.0
                 x = r * x + self.x0_lambdas[i] * x0
-            x, v_carry = blk(x, cos_sin, x0=x0, v_prev=v_carry)
+            ve = self.value_embeds[str(i)](idx) if self._has_ve[i] else None
+            x, v_carry = blk(x, cos_sin, x0=x0, v_prev=v_carry, ve=ve)
         x = self.ln_f(x)
 
         if self.hp.runtime.use_fused_ce and targets is not None and torch.is_grad_enabled():

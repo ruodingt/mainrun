@@ -175,6 +175,8 @@ def _objective(trial, dry_run: bool) -> float:
 
 def main():
     optuna.logging.set_verbosity(optuna.logging.WARNING)
+    from hparams import Hyperparameters
+    Hyperparameters.validate_coverage(BASE_OVERRIDES, context="hypertune BASE_OVERRIDES")
 
     args = sys.argv[1:]
     dry_run  = "--dry-run" in args

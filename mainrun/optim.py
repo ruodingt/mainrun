@@ -300,6 +300,20 @@ class MuonAdamW(torch.optim.Optimizer):
         # Copy back to original params
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
+        # Spectral norm clipping: clip max singular value via power iteration
+        max_sigma = group.get('spectral_clip', 0.0)
+        if max_sigma > 0.0:
+            for p in params:
+                v = torch.randn(p.shape[1], device=p.device, dtype=torch.float32)
+                v /= v.norm()
+                p_f = p.float()
+                for _ in range(5):
+                    u = p_f @ v;  u /= u.norm()
+                    v = p_f.T @ u; v /= v.norm()
+                sigma = (u @ (p_f @ v)).item()
+                if sigma > max_sigma:
+                    p.mul_(max_sigma / sigma)
+
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:

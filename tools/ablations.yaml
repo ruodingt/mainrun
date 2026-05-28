@@ -31,9 +31,15 @@ base:
   norm_emb: false
   logit_softcap: 0.0
   mlp_act: gelu
+  mlp_expand: 4.0
   # --- AttentionHparams ---
   n_q_head: 8
   n_kv_heads: 8             # MHA
+  separate_kv: false
+  use_value_residual: false
+  use_value_residual_x0: false
+  use_value_carry: false
+  ve_gate_channels: 12
   # --- MambaHparams (inactive — no M layers) ---
   expand: 2
   d_head: 64
@@ -44,6 +50,8 @@ base:
   # --- OptimizerHparams ---
   optimizer_type: sgd
   muon_lr: 0.02
+  muon_attn_only: false
+  mlp_lr: 3.0e-4
   adamw_lr: 3.0e-4
   emb_lr: 3.0e-3
   scalar_lr: 1.0e-3
@@ -54,6 +62,12 @@ base:
   warmup_frac: 0.0
   decay_frac: 0.60
   min_lr_frac: 0.0
+  plateau_factor: 0.5
+  plateau_patience: 3
+  sgdr_t0_frac: 0.43
+  wsd_n_cycles: 2
+  wsd_cycle_lr_decay: 1.0
+  spectral_clip: 0.0
   # --- TrainHparams ---
   batch_size: 64
   block_size: 128
@@ -651,3 +665,139 @@ groups:
         desc: "token_anchor only — reference within group9"
         delta:
           use_token_anchor: true
+
+  # ----------------------------------------------------------
+  - name: group10
+    desc: "Vocab size sweep around 16k optimum (28L×256d best config)"
+    group_base:
+      optimizer_type: muon_adamw
+      pos_emb: rope
+      lr_schedule: wsd
+      warmup_frac: 0.05
+      min_lr_frac: 0.05
+      decay_frac: 0.60
+      dropout: 0.1
+      mlp_act: swiglu
+      tie_weights: true
+      use_token_anchor: true
+      layer_pattern: AAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      d_model: 256
+      n_q_head: 4
+      n_kv_heads: 4
+    experiments:
+      - name: g10_00_base
+        desc: "Control: 16k vocab (best from group4)"
+        skip: auto
+
+      - name: g10_01_vocab10k
+        desc: "vocab=10240 — between 8k (hurt) and 16k (best)"
+        delta:
+          vocab_size: 10240
+
+      - name: g10_02_vocab12k
+        desc: "vocab=12288 — between 8k (hurt) and 16k (best)"
+        delta:
+          vocab_size: 12288
+
+      - name: g10_03_vocab8k
+        desc: "vocab=8192 — between 8k (hurt) and 16k (best)"
+        delta:
+          vocab_size: 8192
+
+      - name: g10_04_separate_kv_vocab_10k
+        desc: "vocab=10240, Split kv_proj into k_proj+v_proj: all attention matrices become [256,256] square for Muon"
+        delta:
+          separate_kv: true
+          vocab_size: 10240
+
+      - name: g10_05_spectral_clip
+        desc: "spectral_clip=1.0 on vocab=10240 best config — enforce near-orthogonal weight matrices"
+        delta:
+          vocab_size: 10240
+          spectral_clip: 1.0
+
+      - name: g10_06_muon_attn_only
+        desc: "MLP matrices use AdamW instead of Muon — Muon only on square attn projections"
+        delta:
+          vocab_size: 10240
+          muon_attn_only: true
+
+      - name: g10_07_muon_attn_only_mlp1e3
+        desc: "muon_attn_only + mlp_lr=1e-3 — test higher AdamW LR for MLP matrices"
+        delta:
+          vocab_size: 10240
+          muon_attn_only: true
+          mlp_lr: 1.0e-3
+
+      - name: g10_08_mlp2x
+        desc: "mlp_expand=3.0 → hidden=512 (2:1 ratio) — more square for Muon, ~27% fewer MLP params"
+        delta:
+          vocab_size: 10240
+          mlp_expand: 3.0
+
+      - name: g10_09_mlp1p5x
+        desc: "mlp_expand=2.25 → hidden=384 (1.5:1 ratio) — even more square, ~45% fewer MLP params"
+        delta:
+          vocab_size: 10240
+          mlp_expand: 2.25
+
+  - name: group11
+    desc: "Value Embedding (E layers) — ResFormer-style token-identity injection into V, gated per-head"
+    group_base:
+      optimizer_type: muon_adamw
+      pos_emb: rope
+      lr_schedule: wsd
+      warmup_frac: 0.05
+      min_lr_frac: 0.05
+      decay_frac: 0.60
+      dropout: 0.1
+      mlp_act: swiglu
+      mlp_expand: 4.0
+      tie_weights: true
+      use_token_anchor: true
+      vocab_size: 16000
+      d_model: 256
+      n_q_head: 4
+      n_kv_heads: 4
+    experiments:
+      - name: g11_00_base
+        desc: "vocab=16k. Control: 28A, vocab=16000, no VE (g10_01 repeat)"
+        skip: auto
+
+      - name: g11_01_ve_2e
+        desc: "vocab=16k. 2 E layers at pos 9,19 — AAAAAAAAAEAAAAAAAAAEAAAAAAAA"
+        delta:
+          layer_pattern: AAAAAAAAAEAAAAAAAAAEAAAAAAAA
+
+      - name: g11_02_ve_3e
+        desc: "vocab=16k. 3 E layers at pos 9,18,27 — AAAAAAAAAEAAAAAAAAEAAAAAAAAE"
+        delta:
+          layer_pattern: AAAAAAAAAEAAAAAAAAEAAAAAAAAE
+
+      - name: g11_03_ve_2e_gate16
+        desc: "vocab=16k. 2 E layers, ve_gate_channels=16 — more gate capacity"
+        delta:
+          layer_pattern: AAAAAAAAAEAAAAAAAAAEAAAAAAAA
+          ve_gate_channels: 16
+
+      - name: g11_04_3e_vocab10k
+        desc: "vocab=10k. Control: 28A, vocab=10240, 3 VE - 9,18,27"
+        delta:
+          layer_pattern: AAAAAAAAAEAAAAAAAAEAAAAAAAAE
+          vocab_size: 10240
+
+      - name: g11_05_3e_vocab8k
+        desc: "vocab=8k. Control: 28A, vocab=8192, 3 VE - 9,18,27"
+        delta:
+          layer_pattern: AAAAAAAAAEAAAAAAAAEAAAAAAAAE
+          vocab_size: 8192
+
+      - name: g11_06_ve_4e
+        desc: "vocab=16k. 4VE layers at pos 27, 19, 11, 3 - AAAEAAAAAAAEAAAAAAAEAAAAAAAE"
+        delta:
+          layer_pattern: AAAEAAAAAAAEAAAAAAAEAAAAAAAE
+
+      - name: g11_07_ve_2e
+        desc: "vocab= 16k. 2VE layers at pos 27, 13 - 13AE13AE"
+        delta:
+          layer_pattern: AAAAAAAAAAAAAEAAAAAAAAAAAAAE

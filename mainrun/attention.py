@@ -32,20 +32,31 @@ class CausalSelfAttention(nn.Module):
         assert cfg.d_model % cfg.n_q_head == 0
         self.n_q_head = cfg.n_q_head
         self.head_dim = cfg.d_model // cfg.n_q_head
-        self.n_kv_heads = getattr(cfg, "n_kv_heads", cfg.n_q_head)
-        self.use_sdpa = getattr(cfg, "use_fa2", True)
+        self.n_kv_heads = cfg.n_kv_heads
+        self.use_sdpa = cfg.use_fa2
         self.dropout_p = cfg.dropout
-        self.use_value_residual = getattr(cfg, "use_value_residual", False)
-        self.use_value_residual_x0 = getattr(cfg, "use_value_residual_x0", False)
-        self.use_value_carry = getattr(cfg, "use_value_carry", False)
+        self.use_value_residual = cfg.use_value_residual
+        self.use_value_residual_x0 = cfg.use_value_residual_x0
+        self.use_value_carry = cfg.use_value_carry
         if self.use_value_residual or self.use_value_residual_x0:
             assert self.n_kv_heads * self.head_dim == cfg.d_model, \
                 "use_value_residual requires n_kv_heads * head_dim == d_model (MHA)"
         if self.use_value_carry:
             self.v_lambda = nn.Parameter(torch.zeros(1))
 
+        self.has_ve = cfg.has_ve
+        if self.has_ve:
+            self.ve_gate_channels = cfg.ve_gate_channels
+            self.ve_gate = nn.Linear(cfg.ve_gate_channels, self.n_kv_heads, bias=False)
+
         self.q_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
-        self.kv_proj = nn.Linear(cfg.d_model, 2 * self.n_kv_heads * self.head_dim, bias=False)
+        self.separate_kv = cfg.separate_kv
+        kv_dim = self.n_kv_heads * self.head_dim
+        if self.separate_kv:
+            self.k_proj = nn.Linear(cfg.d_model, kv_dim, bias=False)
+            self.v_proj = nn.Linear(cfg.d_model, kv_dim, bias=False)
+        else:
+            self.kv_proj = nn.Linear(cfg.d_model, 2 * kv_dim, bias=False)
         self.proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
 
         self.attn_drop = nn.Dropout(cfg.dropout)
@@ -56,14 +67,19 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("tril", tril, persistent=False)
 
     def forward(self, x: torch.Tensor, cos_sin, x0: torch.Tensor | None = None,
-                v_prev: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
+                v_prev: torch.Tensor | None = None,
+                ve: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
         B, T, C = x.size()
         # contiguous() after transpose: fixes stride layout before RoPE or SDPA.
         # Without it, torch.compile generates FA2 backward kernels assuming transposed strides,
         # which breaks when RoPE's torch.cat changes q/k to contiguous layout.
         q = self.q_proj(x).view(B, T, self.n_q_head, self.head_dim).transpose(1, 2).contiguous()
-        kv = self.kv_proj(x).view(B, T, 2, self.n_kv_heads, self.head_dim).transpose(1, 3).contiguous()
-        k, v = kv[..., 0, :, :], kv[..., 1, :, :]
+        if self.separate_kv:
+            k = self.k_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2).contiguous()
+            v = self.v_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2).contiguous()
+        else:
+            kv = self.kv_proj(x).view(B, T, 2, self.n_kv_heads, self.head_dim).transpose(1, 3).contiguous()
+            k, v = kv[..., 0, :, :], kv[..., 1, :, :]
 
         if cos_sin is not None:
             cos, sin = cos_sin
@@ -75,6 +91,11 @@ class CausalSelfAttention(nn.Module):
             v = v + x0.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2).contiguous()
         if self.use_value_carry and v_prev is not None:
             v = v + self.v_lambda * v_prev
+        if self.has_ve and ve is not None:
+            # ve: (B, T, kv_dim) → (B, T, n_kv_heads, head_dim)
+            ve = ve.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2).contiguous()
+            gate = 3.0 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_heads)
+            v = v + gate.transpose(1, 2).unsqueeze(-1) * ve
 
         v_out = v  # save before GQA expand, same shape as v_prev next layer
 
@@ -104,15 +125,15 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     """
-    cfg duck-type requirements: d_model, mlp_act, dropout
+    cfg duck-type requirements: d_model, mlp_act, dropout, mlp_expand
     """
     def __init__(self, cfg):
         super().__init__()
         self.mlp_act = cfg.mlp_act
         self.drop = nn.Dropout(cfg.dropout)
         if cfg.mlp_act == "swiglu":
-            # hidden = 8d/3 rounded to nearest multiple of 64 — iso-param vs 2-matrix 4d MLP
-            hidden = round(8 * cfg.d_model / 3 / 64) * 64
+            expand = cfg.mlp_expand
+            hidden = round(expand * cfg.d_model * 2 / 3 / 64) * 64
             self.up   = nn.Linear(cfg.d_model, hidden, bias=False)
             self.gate = nn.Linear(cfg.d_model, hidden, bias=False)
             self.down = nn.Linear(hidden, cfg.d_model, bias=False)

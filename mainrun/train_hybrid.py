@@ -157,7 +157,7 @@ class Trainer:
         args = self.args
         _SCALAR_NAMES = ('x0_lambdas', 'resid_lambdas', 'mixer_scale', 'mlp_scale', 'attn_scale')
         muon_groups: dict[tuple, list] = {}
-        emb_params, scalar_params, other_params = [], [], []
+        emb_params, scalar_params, mlp_params, other_params = [], [], [], []
 
         seen_ids: set[int] = set()
         for name, p in self.model.named_parameters():
@@ -166,23 +166,29 @@ class Trainer:
             seen_ids.add(id(p))
             if any(k in name for k in _SCALAR_NAMES):
                 scalar_params.append(p)
-            elif 'token_emb' in name:
+            elif 'token_emb' in name or 'value_embeds' in name:
                 emb_params.append(p)
-            elif p.ndim == 2 and 'conv' not in name and 'head' not in name:
-                muon_groups.setdefault(tuple(p.shape), []).append(p)
+            elif p.ndim == 2 and 'conv' not in name and 'head' not in name and 've_gate' not in name:
+                if args.optimizer.muon_attn_only and 'mlp' in name:
+                    mlp_params.append(p)
+                else:
+                    muon_groups.setdefault(tuple(p.shape), []).append(p)
             else:
                 other_params.append(p)
 
         adamw_shared = {'kind': 'adamw', 'betas': (0.9, 0.95), 'eps': 1e-8, 'weight_decay': args.optimizer.adamw_wd}
         compute_dtype = torch.bfloat16 if args.runtime.use_bf16 else torch.float32
+        mlp_lr = args.optimizer.mlp_lr if args.optimizer.mlp_lr > 0.0 else args.optimizer.adamw_lr
         self.pg_emb    = {**adamw_shared, 'params': emb_params,    'lr': args.optimizer.emb_lr}
         self.pg_scalar = {**adamw_shared, 'params': scalar_params, 'lr': args.optimizer.scalar_lr}
         self.pg_other  = {**adamw_shared, 'params': other_params,  'lr': args.optimizer.adamw_lr}
         param_groups = [
             *[{'kind': 'muon', 'params': ps, 'lr': args.optimizer.muon_lr,
-               'momentum': 0.95, 'ns_steps': 5, 'beta2': 0.999, 'weight_decay': 0.0}
+               'momentum': 0.95, 'ns_steps': 5, 'beta2': 0.999, 'weight_decay': 0.0,
+               'spectral_clip': args.optimizer.spectral_clip}
               for ps in muon_groups.values()],
             self.pg_emb, self.pg_scalar, self.pg_other,
+            *([{**adamw_shared, 'params': mlp_params, 'lr': mlp_lr}] if mlp_params else []),
         ]
         self.opt = MuonAdamW(param_groups, compute_dtype=compute_dtype)
         self._build_lr_schedule()

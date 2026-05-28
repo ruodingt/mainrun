@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 
 import yaml
+from hparams import Hyperparameters
 
 YAML_PATH = Path(__file__).parent.parent / "tools" / "ablations.yaml"
 EXPERIMENTS_DIR = "./experiments/ablation"
@@ -109,6 +110,7 @@ def main():
     args = parser.parse_args()
 
     base, groups, global_skip = load_yaml()
+    Hyperparameters.validate_coverage(base, context="ablations.yaml base")
 
     all_experiments = list(iter_experiments(groups, global_skip, args.group, args.name))
     total = len(all_experiments)

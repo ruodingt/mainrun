@@ -22,9 +22,11 @@ from typing import Literal
 class AttentionHparams:
     n_q_head: int = 4
     n_kv_heads: int = 4    # 1=MQA, n_q_head=MHA, anything between=GQA
+    separate_kv: bool = False  # split fused kv_proj [2*kv_dim, d] into k_proj + v_proj [kv_dim, d] each (square when MHA)
     use_value_residual: bool = False     # add layer-input x to V before attention
     use_value_residual_x0: bool = False  # add original token embedding x₀ to V
     use_value_carry: bool = False    # v_l = Wv(x) + λ * v_{l-1} (learnable λ, init=0)
+    ve_gate_channels: int = 12  # input channels for ve_gate Linear; only active on 'E' layers
 
 
 @dataclass
@@ -57,6 +59,7 @@ class ModelArchHparams:
     norm_emb: bool = False
     logit_softcap: float = 0.0      # hurts at 28L (group8)
     mlp_act: Literal["relu_sq", "gelu", "swiglu"] = "swiglu"  # best activation (group2)
+    mlp_expand: float = 4.0       # SwiGLU hidden = round(mlp_expand * d_model * 2/3 / 64) * 64; iso-param with GELU 4x
 
     @property
     def n_layer(self) -> int:
@@ -67,6 +70,8 @@ class ModelArchHparams:
 class OptimizerHparams:
     optimizer_type: Literal["muon_adamw", "sgd"] = "muon_adamw"
     muon_lr: float = 0.02       # Muon: 2D weight matrices (attn, mlp)
+    muon_attn_only: bool = False # route MLP 2D matrices to AdamW instead of Muon
+    mlp_lr: float = 1e-3        # AdamW LR for MLP matrices when muon_attn_only=True (0.0 = use adamw_lr)
     adamw_lr: float = 3e-4      # AdamW: norms, biases, other 1D params
     emb_lr: float = 3e-3        # AdamW: token_emb (sparse updates → slightly higher LR)
     scalar_lr: float = 1e-3     # AdamW: ReZero scalars, x0_lambdas
@@ -83,6 +88,7 @@ class OptimizerHparams:
     sgdr_t0_frac: float = 0.43    # SGDR/wsd_cycle: cycle length as fraction of total steps (~3/7)
     wsd_n_cycles: int = 2         # wsd_cycle only: number of WSD cycles
     wsd_cycle_lr_decay: float = 1.0  # wsd_cycle only: max LR multiplier per cycle (e.g. 0.5 = half each restart)
+    spectral_clip: float = 0.0    # Muon only: clip max singular value of weight matrices after each step (0.0 = disabled)
 
 
 @dataclass
@@ -177,6 +183,10 @@ class Hyperparameters:
         if "M" in self.arch.layer_pattern:
             fp.update(asdict(self.mamba))
 
+        # ve_gate_channels only matters when there are E layers
+        if "E" not in self.arch.layer_pattern:
+            fp.pop("ve_gate_channels", None)
+
         # Params whose effect is gated by another param
         if not self.arch.use_token_anchor:
             fp.pop("use_resid_scale", None)
@@ -184,3 +194,26 @@ class Hyperparameters:
             fp.pop("decay_frac", None)
 
         return dict(sorted(fp.items()))
+
+    @staticmethod
+    def validate_coverage(declared: dict, context: str = "") -> None:
+        """
+        Check that `declared` explicitly covers all quality-affecting hparams.
+        Prints warnings for missing keys (declared has no entry) and
+        raises AssertionError for unknown keys (not valid hparam names at all).
+
+        Call this at startup in ablation.py and hypertune.py.
+        """
+        hp = Hyperparameters()
+        valid_keys = set(hp.flat_dict().keys()) | {"n_layer"}
+        fingerprint_keys = set(hp.get_fingerprint().keys())
+
+        # Unknown keys — hard error
+        unknown = set(declared.keys()) - valid_keys
+        assert not unknown, f"{context}: unknown hparam keys: {sorted(unknown)}"
+
+        # Missing fingerprint keys — soft warning
+        missing = fingerprint_keys - set(declared.keys())
+        if missing:
+            tag = f"[{context}] " if context else ""
+            print(f"WARNING {tag}declared config missing fingerprint params (will use Python defaults): {sorted(missing)}")
