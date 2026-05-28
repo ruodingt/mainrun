@@ -455,6 +455,24 @@ class Trainer:
         self.model.train()
         print(f"Profiler: {warmup} warmup + {steps} profile steps")
         print(f"  model: {self.model_params/1e6:.1f}M params  device: {device}")
+
+        # --- Graph break analysis (before warmup so dynamo state is fresh) ---
+        print("\nGraph break analysis...")
+        xb0, yb0, _ = get_batch(self.train_ids, 0, block_size, batch_size, device)
+        explanation = torch._dynamo.explain(self.model)(xb0, yb0)
+        n_graphs = len(explanation.graphs)
+        n_breaks = len(explanation.break_reasons)
+        print(f"  graphs: {n_graphs}  breaks: {n_breaks}")
+        if explanation.break_reasons:
+            seen = {}
+            for br in explanation.break_reasons:
+                reason = str(br.reason)[:80]
+                seen[reason] = seen.get(reason, 0) + 1
+            for reason, count in sorted(seen.items(), key=lambda x: -x[1]):
+                print(f"    [{count}x] {reason}")
+        graph_break_info = {"n_graphs": n_graphs, "n_breaks": n_breaks,
+                            "reasons": [str(br.reason)[:120] for br in explanation.break_reasons]}
+
         for _ in range(warmup):
             _step()
         print("  warmup done")
@@ -569,6 +587,22 @@ class Trainer:
             f"**Model:** {self.model_params/1e6:.1f}M params, {cfg.arch.n_layer}L × {cfg.arch.d_model}d, vocab={cfg.arch.vocab_size}  ",
             f"**Steps:** {warmup} warmup + {steps} profiled  ",
             f"**Throughput:** {tok_s:,.0f} tok/s  ",
+            f"",
+            f"## Graph Breaks",
+            f"",
+            f"| | |",
+            f"|---|---|",
+            f"| Graphs | {graph_break_info['n_graphs']} |",
+            f"| Breaks | {graph_break_info['n_breaks']} |",
+        ]
+        if graph_break_info["reasons"]:
+            seen = {}
+            for r in graph_break_info["reasons"]:
+                seen[r] = seen.get(r, 0) + 1
+            md_lines += ["", "**Break reasons:**", ""]
+            for reason, count in sorted(seen.items(), key=lambda x: -x[1]):
+                md_lines.append(f"- `[{count}x]` {reason}")
+        md_lines += [
             f"",
             f"## Memory",
             f"",
