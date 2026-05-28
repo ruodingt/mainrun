@@ -78,9 +78,8 @@ pass 2: tl.dot → logits tile → softmax → grad_x (local) + grad_W (atomic_a
 logits recomputed in pass 2 (cheaper than spilling `[BLOCK_M, V]` to DRAM).
 
 #### Hardware Limitations (gfx1151)
-- RDNA4 WMMA: 16-bit input only → dot inputs cast to bf16
+- `tl.dot` on gfx1151 requires bf16 inputs (Triton limitation on this target)
 - LDS 64KB → BLOCK_V ≤ 32; autotune selected **BLOCK_V=16**
-- grad_x accumulator `[16, H]` fp32 = 256 VGPRs/thread → occupancy=1
 
 #### Results
 
@@ -92,11 +91,17 @@ Full training step benchmark (B=64, T=128, V=10240, d=256, L=28):
 | Fused CE v2 | 1559 ms | 5815 MB | **1.04x** |
 | Memory savings | | | **1.22x** |
 
-Note: measured without `torch.compile` or operator fusion — reference only. CE kernel contribution is diluted by all other ops; real compiled training impact requires rocprof comparison.
+Note: measured without `torch.compile` or operator fusion — reference only.
 
-#### Why is CE kernel still slower in isolation?
-- 256 VGPRs for grad_x accumulator crushes occupancy to 1 on RDNA4
-- Standard CE = 3 large GEMMs via rocBLAS (optimal tile selection); v2 = custom tiled loop
+#### rocprof kernel breakdown (`rocprof --stats`, 10 steps)
+
+| Kernel | std ms | fused ms |
+|---|---|---|
+| `_fused_ce_kernel.kd` (Triton fused matmul+CE) | — | 8238 |
+| `cunn_SoftMaxBackward` (CE bwd softmax) | 60 | — |
+| CE elementwise kernels (nll_loss etc.) | ~131 | — |
+
+Standard CE uses rocBLAS GEMMs with optimal tile selection; fused CE v2 replaces them with a Triton tiled loop. The Triton kernel is slower per flop than rocBLAS, so the speed advantage is marginal. The memory saving is real: `[B×T, V]` logit tensor is never materialised.
 
 ### Current Status
 **Optionally enabled** (`use_fused_ce=True`, default False). Primary value is **memory (1.22x)**, which could allow larger batch size. Speed benefit at full-step level is marginal (1.04x).
@@ -108,7 +113,7 @@ Note: measured without `torch.compile` or operator fusion — reference only. CE
 | Operation | File | Description |
 |---|---|---|
 | Uncomment CDNA3 configs | `kernels/fused_ce_v2.py` L34-39 | BLOCK_V=64/128, num_stages=2 |
-| Keep bf16 cast or autotune | `kernels/fused_ce_v2.py` | MFMA supports fp32 but bf16 throughput often 2-4x higher; let autotune decide |
+| Review bf16 cast | `kernels/fused_ce_v2.py` | gfx942 Triton may support wider types; let autotune decide |
 | Re-evaluate RMSNorm | `kernels/rms_norm.py` | CDNA3 baseline much stronger; 1.84x may drop |
 | Enable RoPE Triton | `rope.py` | Already 1.15x on gfx1151; HBM3 bandwidth likely widens gap |
 | Rerun autotune | All kernels | Cold run on new hardware |
@@ -132,4 +137,3 @@ Note: measured without `torch.compile` or operator fusion — reference only. CE
 
 - **Enable RoPE Triton**: swap `_apply_rope_native` → `_RoPEFn.apply` in `rope.py`. Correctness verified, 1.15x faster at training shape.
 - **Fused CE batch-size scaling test**: 1.22x memory savings → can increase batch size → measure net tok/s gain.
-- **Profile Fused CE with rocprof**: run `task rocprof-remote` with `use_fused_ce=True` to confirm VGPR occupancy bottleneck via `SQ_INSTS_VALU` ratio.

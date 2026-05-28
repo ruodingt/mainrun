@@ -1,0 +1,22 @@
+version: '3'
+
+vars:
+  PYTHON: /opt/venv/bin/python
+  OUT: ~/tmp/rocprof_ce
+
+tasks:
+  rocprof-ce:
+    desc: "rocprof --stats on standard CE vs fused CE v2; results in ~/tmp/rocprof_ce/"
+    cmds:
+      - mkdir -p {{.OUT}}
+      - rocprof --stats -o {{.OUT}}/std.csv   {{.PYTHON}} rocprof_fused_ce.py {{.CLI_ARGS}}
+      - rocprof --stats -o {{.OUT}}/fused.csv {{.PYTHON}} rocprof_fused_ce.py --fused {{.CLI_ARGS}}
+      - echo "--- Top 15 standard CE ---"
+      - sort -t, -k4 -rn {{.OUT}}/std.stats.csv   | head -16
+      - echo "--- Top 15 fused CE v2 ---"
+      - sort -t, -k4 -rn {{.OUT}}/fused.stats.csv | head -16
+
+  rocprof-ce-diff:
+    desc: "Print side-by-side kernel summary after rocprof-ce has run"
+    cmds:
+      - '{{.PYTHON}} diff_ce_rocprof.py {{.OUT}}'

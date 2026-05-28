@@ -97,8 +97,9 @@ tasks:
     desc: Pull remote logs and profile reports to local
     cmds:
       - rsync -avz amd-container:{{.WORK_DIR}}/logs/ mainrun/logs/
-      - rsync -avz --include="*.md" --exclude="*" amd-container:{{.WORK_DIR}}/profile_out/ profile_out/
+      - rsync -avz --include="*.md" --include="*.json" --exclude="*" amd-container:{{.WORK_DIR}}/profile_out/ profile_out/
       - rsync -avz amd-container:~/tmp/rp_out.stats.csv profile_out/rocprof.stats.csv 2>/dev/null || true
+      - rsync -avz amd-container:~/tmp/rp_out.sys.json profile_out/rocprof.sys.json 2>/dev/null || true
 
   logs:
     desc: Tail remote training log

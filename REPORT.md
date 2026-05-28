@@ -268,7 +268,7 @@ Dedicated per-layer embedding tables injected into V via a learned per-head gate
 embedding tables are separate from `token_emb`, optimised with `emb_lr`.
 
 **Key findings:**
-- VE helps more with vocab=16k than vocab=10k — larger vocab has more token identity signal to inject
+- VE helps more with vocab=16k than vocab=10k — why is unclear
 - With vocab=10k: 4E at interval=8 is the sweet spot (−0.0008 vs no-VE baseline)
 - 5E over-saturates; gate_channels (12 vs 16) makes no meaningful difference
 - Cost: +10.5M params (+42%) for −0.0008 loss gain
@@ -297,7 +297,7 @@ embedding tables are separate from `token_emb`, optimised with `emb_lr`.
 ## Group 12 — Mamba Hybrid (first layer)
 
 Base: best config (28L×256d, vocab=10240, 4E layers, Muon+AdamW+RoPE+WSD)
-**Key finding:** Replacing the first attention layer with Mamba SSM hurts both quality (+0.0076) and throughput (−42% tok/s). At T=128, Mamba's sequential recurrence cannot parallelise over the sequence dimension; pure attention remains better at this scale.
+**Key finding:** Replacing the first attention layer with Mamba SSM hurts both quality (+0.0076) and throughput (−42% tok/s). Pure attention remains better at this scale and sequence length.
 
 | Config | val_loss | Δ vs base | tok/s | Params |
 | --- | --- | --- | --- | --- |
@@ -346,9 +346,7 @@ Full training step benchmark (B=64, T=128, V=10240, d=256, L=28):
 | Fused CE v2, autotuned | **1559 ms (1.04x)** | **5815 MB (1.22x savings)** |
 
 Note: full-step times measured without `torch.compile` or operator fusion — reference only, not representative of compiled training performance. CE kernel contribution is diluted by all other ops.
-Bottleneck in isolation: 256 VGPRs for `grad_x` accumulator crushes occupancy to 1 on RDNA4.
-RDNA4 WMMA only supports 16-bit input → bf16 cast required.
-**Status: Optional** (`use_fused_ce=True`). Primary value is memory savings; speed advantage expected on MI355X.
+**Status: Optional** (`use_fused_ce=True`). Primary value is memory savings (1.22x). Speed on MI355X not measured.
 
 ---
 
@@ -356,10 +354,10 @@ RDNA4 WMMA only supports 16-bit input → bf16 cast required.
 
 ### Profile Report
 
-**Date:** 2026-05-28 13:08  
+**Date:** 2026-05-28 15:03  
 **Config:** `AAAEAAAAAAAEAAAAAAAEAAAAAAAE`  
 **Model:** 35.6M params, 28L × 256d, vocab=10240  
-**Throughput:** 35,310 tok/s  
+**Throughput:** 35,029 tok/s (approximate — includes trace file write)
 
 ### Graph Breaks
 
@@ -379,74 +377,63 @@ RDNA4 WMMA only supports 16-bit input → bf16 cast required.
 
 | Op | Count | CPU time | per call |
 |---|---|---|---|
-| `backward` | 10 | 316.5ms | 31649µs |
-| `autograd::engine::evaluate_function: CompiledFunctionBackwar` | 10 | 292.6ms | 29257µs |
-| `CompiledFunctionBackward` | 10 | 291.1ms | 29108µs |
-| `## Call CompiledFxGraph fbvcwuqulrovfujd7iuc223hzjvp3lnu3ph7` | 10 | 285.0ms | 28501µs |
-| `optimizer_step` | 10 | 233.7ms | 23373µs |
-| `Optimizer.step#MuonAdamW.step` | 10 | 233.4ms | 23341µs |
-| `forward` | 10 | 178.0ms | 17799µs |
-| `Torch-Compiled Region: 0/0` | 10 | 177.1ms | 17711µs |
-| `CompiledFunction` | 10 | 174.0ms | 17398µs |
-| `## Call CompiledFxGraph fol3rwx4wrgfnytmdj2va37jd23ploz2a7vu` | 10 | 170.1ms | 17014µs |
-| `aten::mm` | 5190 | 162.7ms | 31µs |
-| `hipModuleLaunchKernel` | 12240 | 147.0ms | 12µs |
-| `Torch-Compiled Region: 2/2` | 1140 | 99.8ms | 88µs |
-| `## Call CompiledFxGraph fbmxl54y4yvqkz2ubnufvdfv4ujzt3fo5sf7` | 1140 | 78.8ms | 69µs |
-| `hipExtModuleLaunchKernel` | 5830 | 78.1ms | 13µs |
-| `triton_poi_fused_add_copy__div_lerp_mul_neg_pow_rsub_sqrt_0` | 1240 | 47.3ms | 38µs |
-| `aten::_scaled_dot_product_flash_attention_backward` | 280 | 32.9ms | 118µs |
-| `aten::_flash_attention_backward` | 280 | 28.2ms | 101µs |
-| `aten::copy_` | 3660 | 27.9ms | 8µs |
-| `aten::_scaled_dot_product_flash_attention` | 280 | 24.2ms | 86µs |
+| `backward` | 10 | 245.7ms | 24569µs |
+| `autograd::engine::evaluate_function: CompiledFunctionBackwar` | 10 | 222.3ms | 22231µs |
+| `CompiledFunctionBackward` | 10 | 220.9ms | 22088µs |
+| `## Call CompiledFxGraph fbvcwuqulrovfujd7iuc223hzjvp3lnu3ph7` | 10 | 216.7ms | 21675µs |
+| `optimizer_step` | 10 | 179.2ms | 17924µs |
+| `Optimizer.step#MuonAdamW.step` | 10 | 178.9ms | 17892µs |
+| `forward` | 10 | 151.8ms | 15182µs |
+| `Torch-Compiled Region: 0/0` | 10 | 150.8ms | 15076µs |
+| `CompiledFunction` | 10 | 146.6ms | 14664µs |
+| `## Call CompiledFxGraph fol3rwx4wrgfnytmdj2va37jd23ploz2a7vu` | 10 | 142.5ms | 14254µs |
+| `aten::mm` | 5190 | 118.7ms | 23µs |
+| `hipModuleLaunchKernel` | 12240 | 86.7ms | 7µs |
+| `Torch-Compiled Region: 2/2` | 1140 | 73.4ms | 64µs |
+| `## Call CompiledFxGraph fbmxl54y4yvqkz2ubnufvdfv4ujzt3fo5sf7` | 1140 | 56.7ms | 50µs |
+| `hipExtModuleLaunchKernel` | 5830 | 44.9ms | 8µs |
+| `triton_poi_fused_add_copy__div_lerp_mul_neg_pow_rsub_sqrt_0` | 1240 | 30.6ms | 25µs |
+| `aten::_scaled_dot_product_flash_attention_backward` | 280 | 24.6ms | 88µs |
+| `aten::copy_` | 3660 | 23.8ms | 6µs |
+| `aten::_scaled_dot_product_flash_attention` | 280 | 20.5ms | 73µs |
+| `aten::_flash_attention_backward` | 280 | 20.4ms | 73µs |
 
-### Top Ops by CUDA Self Time
+### GPU Utilisation (torch profiler trace)
 
-| Op | Count | CUDA Total | CUDA% | Avg/call | CPU Total |
-|---|---|---|---|---|---|
-| `aten::slice` | 30 | 0.0ms | 0.0% | 0µs | 0.2ms |
-| `aten::as_strided` | 11790 | 0.0ms | 0.0% | 0µs | 6.2ms |
-| `aten::view` | 580 | 0.0ms | 0.0% | 0µs | 0.6ms |
-| `aten::to` | 20 | 0.0ms | 0.0% | 0µs | 1.6ms |
-| `aten::_to_copy` | 20 | 0.0ms | 0.0% | 0µs | 1.5ms |
-| `aten::empty_strided` | 1430 | 0.0ms | 0.0% | 0µs | 2.7ms |
-| `aten::copy_` | 3660 | 0.0ms | 0.0% | 0µs | 27.9ms |
-| `hipStreamGetCaptureInfo` | 30 | 0.0ms | 0.0% | 0µs | 0.0ms |
-| `hipMemcpyWithStream` | 30 | 0.0ms | 0.0% | 0µs | 10.5ms |
-| `Memcpy HtoD (Host -> Device)` | 12 | 0.0ms | 0.0% | 0µs | 0.0ms |
-| `Optimizer.zero_grad#MuonAdamW.zero_grad` | 10 | 0.0ms | 0.0% | 0µs | 3.6ms |
-| `forward` | 10 | 0.0ms | 0.0% | 0µs | 178.0ms |
-| `TorchDynamo Cache Lookup` | 1290 | 0.0ms | 0.0% | 0µs | 7.2ms |
-| `Torch-Compiled Region: 0/0` | 10 | 0.0ms | 0.0% | 0µs | 177.1ms |
-| `Pregraph bytecode` | 1290 | 0.0ms | 0.0% | 0µs | 2.9ms |
-| `AOTDispatcher Runtime Wrapper Prologue` | 1290 | 0.0ms | 0.0% | 0µs | 3.3ms |
-| `CompiledFunction` | 10 | 0.0ms | 0.0% | 0µs | 174.0ms |
-| `## Call CompiledFxGraph fol3rwx4wrgfnytmdj2va37jd23ploz2a7vu` | 10 | 0.0ms | 0.0% | 0µs | 170.1ms |
-| `aten::randint` | 10 | 0.0ms | 0.0% | 0µs | 0.8ms |
-| `aten::resize_` | 10 | 0.0ms | 0.0% | 0µs | 0.0ms |
+Measured from Chrome Trace kernel/memcpy intervals — overlapping kernels counted once.
+
+| Metric | Per step |
+|---|---|
+| GPU span | 171.0 ms |
+| GPU busy (merged intervals) | 162.0 ms |
+| Bubble (within GPU span) | 8.9 ms |
+| GPU utilisation | **94.8%** |
+| Idle gaps > 10 µs | 207 |
+
+GPU utilisation is high at 94.8%. The 8.9 ms/step bubble is from phase-transition gaps (forward → backward → optimizer), not CPU dispatch saturation.
+
+_Note: GPU span < wall-clock step time because trace does not capture CPU-only_  
+_overhead (data loading, Python dispatch). CPU dispatch is not a bottleneck at this scale._
 
 ### Top Kernels by GPU Time (rocprof --stats)
 
-
-**Bubble (rocprof):** wall 232.0 ms/step, kernel sum 257.4 ms/step — kernel sum exceeds wall time, indicating significant kernel overlap. Accurate bubble requires `rocprof --sys-trace` for timeline analysis.
-
 | Kernel | Calls | Total | Avg | % |
 |---|---|---|---|---|
-| `Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x96x32` | 2652 | 312.4ms | 118µs | 12.1% |
-| `Cijk_Ailk_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x32x64` | 1820 | 307.2ms | 169µs | 11.9% |
-| `Cijk_Alik_Bljk_S_B_Bias_HA_S_SAV_UserArgs_MT16x16x16_SN` | 173 | 223.0ms | 1289µs | 8.7% |
-| `Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x96x32` | 1157 | 176.9ms | 153µs | 6.9% |
-| `attn_fwd.kd` | 392 | 129.5ms | 330µs | 5.0% |
-| `triton_poi_fused__unsafe_view_add_fill_mul_sigmoid_silu` | 364 | 81.6ms | 224µs | 3.2% |
-| `Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x160x3` | 793 | 70.7ms | 89µs | 2.7% |
-| `Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT96x96x32` | 377 | 69.5ms | 184µs | 2.7% |
-| `bwd_kernel_dk_dv.kd` | 364 | 62.7ms | 172µs | 2.4% |
-| `Cijk_Ailk_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x48x32` | 364 | 59.9ms | 164µs | 2.3% |
-| `__amd_rocclr_copyBuffer.kd` | 4955 | 52.1ms | 11µs | 2.0% |
-| `triton_red_fused__log_softmax__log_softmax_backward_dat` | 13 | 51.8ms | 3988µs | 2.0% |
-| `triton_per_fused__to_copy_add_mul_native_dropout_backwa` | 273 | 51.5ms | 189µs | 2.0% |
-| `Cijk_Ailk_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x96x32` | 143 | 51.1ms | 357µs | 2.0% |
-| `triton_per_fused__to_copy__unsafe_view_add_native_dropo` | 351 | 48.5ms | 138µs | 1.9% |
+| `Cijk_Alik_Bljk_S_B_Bias_HA_S_SAV_UserArgs_MT16x16x8_SN_` | 173 | 179.7ms | 1039µs | 26.1% |
+| `Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x96x32` | 408 | 48.6ms | 119µs | 7.1% |
+| `Cijk_Ailk_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x32x64` | 280 | 47.7ms | 170µs | 6.9% |
+| `attn_fwd` | 84 | 41.4ms | 493µs | 6.0% |
+| `triton_red_fused__to_copy_add_mul_native_dropout_backwa` | 214 | 30.6ms | 143µs | 4.5% |
+| `Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x96x32` | 178 | 27.3ms | 154µs | 4.0% |
+| `triton_red_fused__to_copy_add_mul_native_dropout_native` | 41 | 27.1ms | 660µs | 3.9% |
+| `triton_red_fused__to_copy_add_mul_native_dropout_native` | 41 | 25.8ms | 628µs | 3.7% |
+| `triton_red_fused__to_copy_add_mul_native_dropout_native` | 41 | 25.6ms | 624µs | 3.7% |
+| `triton_poi_fused__unsafe_view_add_fill_mul_sigmoid_silu` | 56 | 12.9ms | 230µs | 1.9% |
+| `Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x160x3` | 122 | 11.5ms | 94µs | 1.7% |
+| `Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT96x96x32` | 58 | 10.9ms | 188µs | 1.6% |
+| `bwd_kernel_dk_dv` | 56 | 9.8ms | 175µs | 1.4% |
+| `Cijk_Ailk_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x48x32` | 56 | 9.3ms | 166µs | 1.4% |
+| `void at::native::elementwise_kernel_manual_unroll<128, ` | 256 | 8.9ms | 35µs | 1.3% |
 
 ---
 
@@ -469,15 +456,15 @@ RDNA4 WMMA only supports 16-bit input → bf16 cast required.
 
 ### 1. Weight initialisation exploration was insufficient
 
-Muon's theoretical motivation calls for uniform initialisation with fan-in scaling — the gradient orthogonalisation step in Muon works better when the initial singular value spectrum is flat (no tails). We tested `muon_uniform` vs `gpt2` in a single group-1 experiment and found `gpt2` wins by 0.03 val_loss, but we did not investigate *why*. The most likely confound is weight tying: `lm_head` shares weights with `token_emb`, forcing embedding std to 0.02 regardless of the init scheme, which may have neutralised any benefit from uniform Muon inits. A cleaner experiment would decouple the two (at the cost of ~4M params) before drawing conclusions about Muon init theory.
+We tested `muon_uniform` vs `gpt2` init in a single group-1 experiment and found `gpt2` wins by 0.03 val_loss. We did not investigate why. One possible confound is weight tying: `lm_head` shares weights with `token_emb`, which may have interacted differently with each init scheme. A cleaner experiment would decouple the two before drawing conclusions.
 
 ### 2. Custom kernels before profiling — wrong order
 
-We wrote three Triton kernels (RMSNorm, RoPE, fused CE) before running any profiler. When we eventually ran `rocprof --stats` on the best config, the results showed the dominant cost was CPU dispatch latency (43% bubble) and small GEMM tile selection caused by d_model=256 — neither of which our kernels address. The correct workflow is: **profile first, identify hot kernels, then write targeted replacements**. Of the three kernels, none ended up in the final training path: RMSNorm is unused (final config uses LayerNorm), RoPE Triton was discovered to be faster only after correcting the benchmark shape late in the project, and fused CE provides memory savings but marginal speed improvement on gfx1151.
+We wrote three Triton kernels (RMSNorm, RoPE, fused CE) before running any profiler. When we eventually profiled the best config with torch profiler traces, GPU utilisation was already 94.8% — meaning there was no large dispatch bubble to fix. The correct workflow is: **profile first, identify hot kernels, then write targeted replacements**. Of the three kernels, none ended up in the final training path: RMSNorm is unused (final config uses LayerNorm), RoPE Triton was discovered to be faster only after correcting the benchmark shape late in the project, and fused CE provides memory savings but marginal speed improvement on gfx1151.
 
 ### 3. Vocab size was fixed too early
 
-`vocab_size` was not systematically swept until Group 10 — after nine groups of experiments all run at `vocab_size=16000`. The final optimal value turned out to be 10240 (−0.004 vs 16k). This means Groups 1–9 were optimising on a suboptimal vocabulary, and some conclusions may not fully transfer: in particular, the value embedding experiments (Group 11) showed VE benefits more with vocab=16k than 10k, suggesting the Group 11 results are partly an artefact of the vocab choice. Vocab size interacts with embedding dimensionality, weight tying, and token identity signal; it should be treated as a foundational hyperparameter and swept in the first group rather than the tenth.
+`vocab_size` was not systematically swept until Group 10 — after nine groups of experiments all run at `vocab_size=16000`. The final optimal value turned out to be 10240 (−0.004 vs 16k). This means Groups 1–9 were optimising on a suboptimal vocabulary, and some conclusions may not fully transfer: in particular, the value embedding experiments (Group 11) showed VE benefits more with vocab=16k than 10k, suggesting the Group 11 results are partly an artefact of the vocab choice. Vocab size interacts with embedding dimensionality and weight tying; it should be treated as a foundational hyperparameter and swept in the first group rather than the tenth.
 
 ### 4. Sequential ablation search misses interactions; automatic tuning was underused
 
@@ -489,7 +476,7 @@ The final architecture includes 4 E-type (value embedding) layers, contributing 
 
 ### 6. Mamba hybrid did not help
 
-A single experiment (g12_01) replaced the first attention layer with a Mamba SSM layer, keeping all other best-config settings (28L×256d, vocab=10240, 4E layers). Result: val_loss worsened by 0.0076 (1.1650→1.1726) and throughput dropped from 41,947 to 24,174 tok/s — a 42% speed penalty. The speed regression is expected: Mamba's sequential recurrence cannot be parallelised over the sequence dimension the way attention can, and at T=128 the SSM overhead outweighs any potential efficiency gain. The quality regression suggests that at this scale and sequence length, the first-layer position is better served by attention's global context than by Mamba's local state. Hybrid architectures may have merit at longer sequences or larger scale, but within this project's constraints the result is a clear negative.
+A single experiment (g12_01) replaced the first attention layer with a Mamba SSM layer, keeping all other best-config settings (28L×256d, vocab=10240, 4E layers). Result: val_loss worsened by 0.0076 (1.1650→1.1726) and throughput dropped from 41,947 to 24,174 tok/s — a 42% speed penalty. The 42% speed drop is likely due to the absence of an optimised ROCm Mamba kernel — the selective scan ran without hardware-specific tuning available to Flash Attention. The quality regression suggests that at this scale and sequence length, attention is simply better. Hybrid architectures may have merit at longer sequences or larger scale, but within this project's constraints the result is a clear negative.
 
 ### 4. TensorBoard integration added limited value
 

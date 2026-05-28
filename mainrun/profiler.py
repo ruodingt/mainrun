@@ -82,7 +82,6 @@ class ProfilerMixin:
         if device == "cuda":
             activities.append(ProfilerActivity.CUDA)
         torch.cuda.reset_peak_memory_stats()
-        t0 = time.time()
 
         with tprofile(
             activities=activities,
@@ -91,11 +90,11 @@ class ProfilerMixin:
             profile_memory=True,
             on_trace_ready=torch.profiler.tensorboard_trace_handler(output),
         ) as prof:
+            t0 = time.time()
             for _ in range(steps):
                 _step()
                 prof.step()
-
-        elapsed  = time.time() - t0
+            elapsed = time.time() - t0  # measure before trace file write
         tok_s    = steps * block_size * batch_size / elapsed
         key_avgs = prof.key_averages()
         total_cuda = sum(_cuda_us(e) for e in key_avgs)
@@ -149,7 +148,7 @@ class ProfilerMixin:
         bubble_us  = max(elapsed_us - gpu_busy_us, 0)
         busy_pct   = gpu_busy_us / elapsed_us * 100 if elapsed_us > 0 else 0
 
-        print(f"\nThroughput: {tok_s:,.0f} tok/s  ({elapsed:.1f}s)")
+        print(f"\nThroughput: {tok_s:,.0f} tok/s (approximate)  ({elapsed:.1f}s)")
 
         col_w  = [48, 7, 12, 7, 10, 12]
         fmt    = "  ".join(f"{{:<{w}}}" for w in col_w)
@@ -201,7 +200,7 @@ class ProfilerMixin:
             f"**Config:** `{cfg.arch.layer_pattern}`  ",
             f"**Model:** {self.model_params/1e6:.1f}M params, "
             f"{cfg.arch.n_layer}L × {cfg.arch.d_model}d, vocab={cfg.arch.vocab_size}  ",
-            f"**Throughput:** {tok_s:,.0f} tok/s  ",
+            f"**Throughput:** {tok_s:,.0f} tok/s (approximate — excludes trace file write)  ",
             "",
             "## Graph Breaks", "",
             "| | |", "|---|---|",

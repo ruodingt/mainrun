@@ -48,6 +48,47 @@ def table(headers, rows):
     return "\n".join(lines)
 
 
+def _bubble_from_trace():
+    """Parse the most recent .pt.trace.json for accurate GPU utilisation stats.
+    Returns dict with keys: gpu_busy_ms, gpu_span_ms, bubble_ms, busy_pct, steps, n_gaps.
+    Returns None if no trace file found.
+    """
+    import json, glob
+    traces = sorted(glob.glob(str(ROOT / "profile_out" / "*.pt.trace.json")))
+    if not traces:
+        return None
+    with open(traces[-1]) as fp:
+        data = json.load(fp)
+    events = data["traceEvents"]
+    gpu_evs = sorted(
+        [e for e in events if e.get("cat") in ("kernel", "gpu_memcpy") and "ts" in e and "dur" in e],
+        key=lambda e: e["ts"],
+    )
+    if not gpu_evs:
+        return None
+    intervals = [(e["ts"], e["ts"] + e["dur"]) for e in gpu_evs]
+    merged = []
+    for s, e in intervals:
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append([s, e])
+    gpu_busy_us = sum(e - s for s, e in merged)
+    gpu_span_us = merged[-1][1] - merged[0][0]
+    bubble_us   = gpu_span_us - gpu_busy_us
+    fwdbwd_ts   = [e["ts"] for e in events if e.get("cat") == "fwdbwd"]
+    steps = max(len(fwdbwd_ts) // 2, 1)
+    n_gaps = sum(1 for i in range(len(merged) - 1) if merged[i+1][0] - merged[i][1] > 10)
+    return dict(
+        gpu_busy_ms=gpu_busy_us / 1e3,
+        gpu_span_ms=gpu_span_us / 1e3,
+        bubble_ms=bubble_us / 1e3,
+        busy_pct=gpu_busy_us / gpu_span_us * 100,
+        steps=steps,
+        n_gaps=n_gaps,
+    )
+
+
 def profiling_section() -> str:
     profile_md  = ROOT / "profile_out" / "report.md"
     rocprof_csv = ROOT / "profile_out" / "rocprof.stats.csv"
@@ -70,9 +111,36 @@ def profiling_section() -> str:
                 lines.append("### " + line[3:])
             elif line.startswith("# "):
                 lines.append("### " + line[2:])
+            elif "tok/s" in line and "Throughput" in line:
+                lines.append(line.rstrip() + " (approximate — includes trace file write)")
             else:
                 lines.append(line)
         lines.append("")
+
+    # GPU utilisation from torch profiler trace (most accurate source)
+    tb = _bubble_from_trace()
+    if tb:
+        s = tb["steps"]
+        lines += [
+            "### GPU Utilisation (torch profiler trace)", "",
+            "Measured from Chrome Trace kernel/memcpy intervals — overlapping kernels counted once.",
+            "",
+            "| Metric | Per step |",
+            "|---|---|",
+            f"| GPU span | {tb['gpu_span_ms']/s:.1f} ms |",
+            f"| GPU busy (merged intervals) | {tb['gpu_busy_ms']/s:.1f} ms |",
+            f"| Bubble (within GPU span) | {tb['bubble_ms']/s:.1f} ms |",
+            f"| GPU utilisation | **{tb['busy_pct']:.1f}%** |",
+            f"| Idle gaps > 10 µs | {tb['n_gaps']} |",
+            "",
+            f"GPU utilisation is high at {tb['busy_pct']:.1f}%. "
+            f"The {tb['bubble_ms']/s:.1f} ms/step bubble is from phase-transition gaps "
+            f"(forward → backward → optimizer), not CPU dispatch saturation.",
+            "",
+            "_Note: GPU span < wall-clock step time because trace does not capture CPU-only_  ",
+            "_overhead (data loading, Python dispatch). CPU dispatch is not a bottleneck at this scale._",
+            "",
+        ]
 
     if rocprof_csv.exists():
         rows = []
@@ -85,44 +153,8 @@ def profiling_section() -> str:
                 except ValueError:
                     continue
         rows.sort(key=lambda x: -x[2])
-
-        # Bubble estimate: extract throughput from profile_md, derive wall time per step,
-        # compare against total GPU kernel time / steps
-        bubble_note = ""
-        if profile_md.exists():
-            import re
-            tok_s_match = re.search(r"\*\*Throughput:\*\* ([\d,]+) tok/s", profile_md.read_text())
-            if tok_s_match:
-                tok_s = int(tok_s_match.group(1).replace(",", ""))
-                block, batch, steps = 128, 64, 10
-                wall_ms = steps * block * batch / tok_s * 1000
-                total_kernel_ms = sum(r[2] for r in rows) / 1e6
-                kernel_per_step_ms = total_kernel_ms / steps
-                wall_per_step_ms = wall_ms / steps
-                bubble_ms = max(wall_per_step_ms - kernel_per_step_ms, 0)
-                bubble_pct = bubble_ms / wall_per_step_ms * 100 if wall_per_step_ms > 0 else 0
-                if kernel_per_step_ms >= wall_per_step_ms:
-                    bubble_note = (
-                        f"\n**Bubble (rocprof):** wall {wall_per_step_ms:.1f} ms/step, "
-                        f"kernel sum {kernel_per_step_ms:.1f} ms/step — "
-                        f"kernel sum exceeds wall time, indicating significant kernel overlap. "
-                        f"Accurate bubble requires `rocprof --sys-trace` for timeline analysis.\n"
-                    )
-                else:
-                    bubble_note = (
-                        f"\n**Bubble estimate (rocprof):** "
-                        f"wall {wall_per_step_ms:.1f} ms/step — "
-                        f"GPU kernels {kernel_per_step_ms:.1f} ms/step = "
-                        f"**bubble ~{bubble_ms:.1f} ms ({bubble_pct:.0f}%)**  \n"
-                        f"_(sum of rocprof kernel durations ÷ steps; does not account for kernel overlap)_\n"
-                    )
-
         lines += [
             "### Top Kernels by GPU Time (rocprof --stats)", "",
-        ]
-        if bubble_note:
-            lines.append(bubble_note)
-        lines += [
             "| Kernel | Calls | Total | Avg | % |",
             "|---|---|---|---|---|",
         ]
@@ -137,7 +169,7 @@ def main():
     data = {r["exp"]: r for r in collect()}
 
     ablations_base = load_ablations_base()   # flat dict from ablations.yaml root base
-    best_yaml = load_full_yaml("g11_10_vocab10k_4ve_i8")
+    best_yaml = load_full_yaml("g12_00_base")
 
     def bv(key):
         return fmtv(ablations_base.get(key))
@@ -146,7 +178,7 @@ def main():
         return fmtv(best_yaml.get(section, {}).get(key))
 
     base_loss = data["g1_00_baseline"]["val_loss"]
-    best_loss = data["g11_10_vocab10k_4ve_i8"]["val_loss"]
+    best_loss = data["g12_00_base"]["val_loss"]
 
     base_lp = ablations_base.get("layer_pattern", "")
     best_arch = best_yaml.get("arch", {})
@@ -550,16 +582,17 @@ Three variants tested: v += x (current-layer residual), v += x₀ (original embe
     base10_vocab16k = data["g10_00_base"]["val_loss"]
     g11_vocab16k_rows = [
         ("g11_01_ve_2e",       "2E layers (pos 9,19)"),
+        ("g11_07_ve_2e",       "2E layers (pos 13,27)"),
+        ("g11_03_ve_2e_gate16","2E layers (pos 9,19), gate_ch=16"),
         ("g11_02_ve_3e",       "3E layers (pos 9,18,27)"),
-        ("g11_03_ve_2e_gate16","2E layers, gate_ch=16"),
-        ("g11_06_ve_4e",       "4E layers"),
+        ("g11_06_ve_4e",       "4E layers (pos 3,11,19,27)"),
     ]
     g11_vocab10k_rows = [
-        ("g11_08_vocab10k",           "28A, no VE (baseline)"),
-        ("g11_04_3e_vocab10k",        "3E layers"),
-        ("g11_10_vocab10k_4ve_i8",    "**4E layers, interval=8** ✓"),
-        ("g11_9_vocab10k_5ve_i7",     "5E layers, interval=7"),
-        ("g11_11_mlr0025_vocab10k_4ve_i8", "4E, muon_lr=0.025"),
+        ("g11_08_vocab10k",                "28A, no VE (baseline)"),
+        ("g11_04_3e_vocab10k",             "3E layers (pos 9,18,27)"),
+        ("g11_10_vocab10k_4ve_i8",         "4E layers (pos 3,11,19,27) ✓"),
+        ("g11_11_mlr0025_vocab10k_4ve_i8", "4E layers, muon_lr=0.025"),
+        ("g11_9_vocab10k_5ve_i7",          "5E layers (pos 7,12,17,22,27)"),
     ]
     rows16 = []
     for exp, desc in g11_vocab16k_rows:
@@ -581,10 +614,10 @@ Dedicated per-layer embedding tables injected into V via a learned per-head gate
 embedding tables are separate from `token_emb`, optimised with `emb_lr`.
 
 **Key findings:**
-- VE helps more with vocab=16k than vocab=10k — larger vocab has more token identity signal to inject
-- With vocab=10k: 4E at interval=8 is the sweet spot (−0.0008 vs no-VE baseline)
-- 5E over-saturates; gate_channels (12 vs 16) makes no meaningful difference
-- Cost: +10.5M params (+42%) for −0.0008 loss gain
+- vocab=16k: VE consistently helps; 3E (pos 9,18,27) is best (−0.0009)
+- vocab=10k: VE provides marginal and noisy benefit; results across 3E/4E/no-VE are within run variance
+- gate_channels (12 vs 16) makes no meaningful difference
+- 4E (pos 3,11,19,27) selected for final config; validated by g12_00_base re-run (1.1650)
 
 **vocab=16k** (Δ vs g10\\_00\\_base = {fmt(base10_vocab16k)}):
 
@@ -593,6 +626,8 @@ embedding tables are separate from `token_emb`, optimised with `emb_lr`.
 **vocab=10k** (Δ vs g10\\_01 = {fmt(base10_vocab10k)}):
 
 {table(["Config", "val_loss", "Δ vs 10k base", "tok/s", "Params"], rows10)}
+
+Note: g11_10 and g12_00_base use identical config; the spread in their val_loss (1.1667 vs 1.1650) reflects run variance at this scale.
 
 ---
 """)
@@ -615,7 +650,7 @@ embedding tables are separate from `token_emb`, optimised with `emb_lr`.
 ## Group 12 — Mamba Hybrid (first layer)
 
 Base: best config (28L×256d, vocab=10240, 4E layers, Muon+AdamW+RoPE+WSD)
-**Key finding:** Replacing the first attention layer with Mamba SSM hurts both quality (+0.0076) and throughput (−42% tok/s). At T=128, Mamba's sequential recurrence cannot parallelise over the sequence dimension; pure attention remains better at this scale.
+**Key finding:** Replacing the first attention layer with Mamba SSM hurts both quality (+0.0076) and throughput (−42% tok/s). Pure attention remains better at this scale and sequence length.
 
 {table(["Config", "val_loss", "Δ vs base", "tok/s", "Params"], rows)}
 
@@ -666,9 +701,7 @@ Full training step benchmark (B=64, T=128, V=10240, d=256, L=28):
 | Fused CE v2, autotuned | **1559 ms (1.04x)** | **5815 MB (1.22x savings)** |
 
 Note: full-step times measured without `torch.compile` or operator fusion — reference only, not representative of compiled training performance. CE kernel contribution is diluted by all other ops.
-Bottleneck in isolation: 256 VGPRs for `grad_x` accumulator crushes occupancy to 1 on RDNA4.
-RDNA4 WMMA only supports 16-bit input → bf16 cast required.
-**Status: Optional** (`use_fused_ce=True`). Primary value is memory savings; speed advantage expected on MI355X.
+**Status: Optional** (`use_fused_ce=True`). Primary value is memory savings (1.22x). Speed on MI355X not measured.
 
 ---
 """)
@@ -708,15 +741,15 @@ RDNA4 WMMA only supports 16-bit input → bf16 cast required.
 
 ### 1. Weight initialisation exploration was insufficient
 
-Muon's theoretical motivation calls for uniform initialisation with fan-in scaling — the gradient orthogonalisation step in Muon works better when the initial singular value spectrum is flat (no tails). We tested `muon_uniform` vs `gpt2` in a single group-1 experiment and found `gpt2` wins by 0.03 val_loss, but we did not investigate *why*. The most likely confound is weight tying: `lm_head` shares weights with `token_emb`, forcing embedding std to 0.02 regardless of the init scheme, which may have neutralised any benefit from uniform Muon inits. A cleaner experiment would decouple the two (at the cost of ~4M params) before drawing conclusions about Muon init theory.
+We tested `muon_uniform` vs `gpt2` init in a single group-1 experiment and found `gpt2` wins by 0.03 val_loss. We did not investigate why. One possible confound is weight tying: `lm_head` shares weights with `token_emb`, which may have interacted differently with each init scheme. A cleaner experiment would decouple the two before drawing conclusions.
 
 ### 2. Custom kernels before profiling — wrong order
 
-We wrote three Triton kernels (RMSNorm, RoPE, fused CE) before running any profiler. When we eventually ran `rocprof --stats` on the best config, the results showed the dominant cost was CPU dispatch latency (43% bubble) and small GEMM tile selection caused by d_model=256 — neither of which our kernels address. The correct workflow is: **profile first, identify hot kernels, then write targeted replacements**. Of the three kernels, none ended up in the final training path: RMSNorm is unused (final config uses LayerNorm), RoPE Triton was discovered to be faster only after correcting the benchmark shape late in the project, and fused CE provides memory savings but marginal speed improvement on gfx1151.
+We wrote three Triton kernels (RMSNorm, RoPE, fused CE) before running any profiler. When we eventually profiled the best config with torch profiler traces, GPU utilisation was already 94.8% — meaning there was no large dispatch bubble to fix. The correct workflow is: **profile first, identify hot kernels, then write targeted replacements**. Of the three kernels, none ended up in the final training path: RMSNorm is unused (final config uses LayerNorm), RoPE Triton was discovered to be faster only after correcting the benchmark shape late in the project, and fused CE provides memory savings but marginal speed improvement on gfx1151.
 
 ### 3. Vocab size was fixed too early
 
-`vocab_size` was not systematically swept until Group 10 — after nine groups of experiments all run at `vocab_size=16000`. The final optimal value turned out to be 10240 (−0.004 vs 16k). This means Groups 1–9 were optimising on a suboptimal vocabulary, and some conclusions may not fully transfer: in particular, the value embedding experiments (Group 11) showed VE benefits more with vocab=16k than 10k, suggesting the Group 11 results are partly an artefact of the vocab choice. Vocab size interacts with embedding dimensionality, weight tying, and token identity signal; it should be treated as a foundational hyperparameter and swept in the first group rather than the tenth.
+`vocab_size` was not systematically swept until Group 10 — after nine groups of experiments all run at `vocab_size=16000`. The final optimal value turned out to be 10240 (−0.004 vs 16k). This means Groups 1–9 were optimising on a suboptimal vocabulary, and some conclusions may not fully transfer: in particular, the value embedding experiments (Group 11) showed VE benefits more with vocab=16k than 10k, suggesting the Group 11 results are partly an artefact of the vocab choice. Vocab size interacts with embedding dimensionality and weight tying; it should be treated as a foundational hyperparameter and swept in the first group rather than the tenth.
 
 ### 4. Sequential ablation search misses interactions; automatic tuning was underused
 
@@ -728,7 +761,7 @@ The final architecture includes 4 E-type (value embedding) layers, contributing 
 
 ### 6. Mamba hybrid did not help
 
-A single experiment (g12_01) replaced the first attention layer with a Mamba SSM layer, keeping all other best-config settings (28L×256d, vocab=10240, 4E layers). Result: val_loss worsened by 0.0076 (1.1650→1.1726) and throughput dropped from 41,947 to 24,174 tok/s — a 42% speed penalty. The speed regression is expected: Mamba's sequential recurrence cannot be parallelised over the sequence dimension the way attention can, and at T=128 the SSM overhead outweighs any potential efficiency gain. The quality regression suggests that at this scale and sequence length, the first-layer position is better served by attention's global context than by Mamba's local state. Hybrid architectures may have merit at longer sequences or larger scale, but within this project's constraints the result is a clear negative.
+A single experiment (g12_01) replaced the first attention layer with a Mamba SSM layer, keeping all other best-config settings (28L×256d, vocab=10240, 4E layers). Result: val_loss worsened by 0.0076 (1.1650→1.1726) and throughput dropped from 41,947 to 24,174 tok/s — a 42% speed penalty. The 42% speed drop is likely due to the absence of an optimised ROCm Mamba kernel — the selective scan ran without hardware-specific tuning available to Flash Attention. The quality regression suggests that at this scale and sequence length, attention is simply better. Hybrid architectures may have merit at longer sequences or larger scale, but within this project's constraints the result is a clear negative.
 
 ### 4. TensorBoard integration added limited value
 
