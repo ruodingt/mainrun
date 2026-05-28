@@ -512,6 +512,37 @@ class Trainer:
             rsvd  = torch.cuda.max_memory_reserved() / 1e9
             print(f"\nPeak memory: {alloc:.2f} GB allocated  /  {rsvd:.2f} GB reserved")
 
+        # --- Bubble analysis ---
+        elapsed_us = elapsed * 1e6
+        gpu_busy_us = total_cuda
+        bubble_us = elapsed_us - gpu_busy_us
+        bubble_pct = bubble_us / elapsed_us * 100 if elapsed_us > 0 else 0
+        print(f"\n{'='*72}")
+        print(f"GPU bubble analysis")
+        print(f"{'='*72}")
+        print(f"  Wall time   : {elapsed_us/1e3:.1f} ms")
+        print(f"  GPU busy    : {gpu_busy_us/1e3:.1f} ms  ({100-bubble_pct:.1f}%)")
+        print(f"  Bubble      : {bubble_us/1e3:.1f} ms  ({bubble_pct:.1f}%)")
+
+        # Top CPU-overhead ops: cpu_time >> cuda_time → GPU waiting for dispatch
+        print(f"\nTop CPU-overhead ops (cpu_time - cuda_time, GPU idle sources):")
+        overhead = []
+        for e in key_avgs:
+            cuda_us = _cuda_us(e)
+            cpu_overhead = e.cpu_time_total - cuda_us
+            if cpu_overhead > 0 and e.count > 0:
+                overhead.append((cpu_overhead, e))
+        overhead.sort(reverse=True)
+        oh_fmt = "  {:<48}  {:>8}  {:>10}  {:>10}"
+        print(oh_fmt.format("Op", "Count", "CPU ovhd", "per call"))
+        print(oh_fmt.format("-"*48, "-"*8, "-"*10, "-"*10))
+        for cpu_oh, e in overhead[:10]:
+            print(oh_fmt.format(
+                e.key[:48], str(e.count),
+                f"{cpu_oh/1e3:.1f}ms",
+                f"{cpu_oh/e.count:.0f}us",
+            ))
+
         print(f"\nTrace → {output}/")
         print(f"  TensorBoard: tensorboard --logdir {output}")
 
