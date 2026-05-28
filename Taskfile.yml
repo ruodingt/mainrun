@@ -136,7 +136,7 @@ tasks:
     desc: "Run ablation group on remote in background (usage: task ablation-remote -- group1)"
     deps: [checkpoint]
     cmds:
-      - rsync -avz mainrun/configs/ablations.yaml amd-container:{{.WORK_DIR}}/mainrun/configs/
+      - rsync -avz mainrun/mainrun/configs/ablations.yaml amd-container:{{.WORK_DIR}}/configs/
       - '{{.SSH}} "cd {{.WORK_DIR}} && nohup {{.PYTHON}} -u ablation.py --group {{.CLI_ARGS}} > logs/ablation.out 2>logs/ablation.err </dev/null & disown"'
 
   ablation-logs:
