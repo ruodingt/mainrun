@@ -70,9 +70,10 @@ tasks:
       - '{{.SSH}} "cd {{.WORK_DIR}} && {{.PYTHON}} train_hybrid.py --profile {{.CLI_ARGS}}"'
 
   sync:
-    desc: Pull remote logs to local
+    desc: Pull remote logs and profile reports to local
     cmds:
       - rsync -avz amd-container:{{.WORK_DIR}}/logs/ mainrun/logs/
+      - rsync -avz --include="*.md" --exclude="*" amd-container:{{.WORK_DIR}}/profile_out/ profile_out/
 
   logs:
     desc: Tail remote training log
