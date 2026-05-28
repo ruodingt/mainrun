@@ -544,6 +544,7 @@ if __name__ == "__main__":
     from pathlib import Path
     config_path = Path(cli.config)
     assert config_path.exists(), f"config not found: {config_path}"
+    print(f"Loading config: {config_path.resolve()}")
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
     args.update_from_flat({k: v for k, v in cfg.items() if not str(k).startswith("#")})
