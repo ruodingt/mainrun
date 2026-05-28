@@ -129,19 +129,21 @@ class Trainer:
 
         print("vocab:", tok.vocab_size)
         args.arch.vocab_size = tok.vocab_size
-        self.logger.log("dataset_info",
-                        titles_count=len(train_titles),
-                        epochs=args.fixed.epochs,
-                        batches_per_epoch=self.batches,
-                        tokens_per_epoch=len(self.train_ids),
-                        vocab_size=tok.vocab_size)
+        if self.logger:
+            self.logger.log("dataset_info",
+                            titles_count=len(train_titles),
+                            epochs=args.fixed.epochs,
+                            batches_per_epoch=self.batches,
+                            tokens_per_epoch=len(self.train_ids),
+                            vocab_size=tok.vocab_size)
 
     def _build_model(self):
         args = self.args
         model = HybridLM(args, self.tok.vocab_size).to(self.device)
         self.model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        self.logger.log("model_info", parameters_count=self.model_params)
-        expt_util.save_model_summary(model, self.exp_dir, self.run_dir)
+        if self.logger:
+            self.logger.log("model_info", parameters_count=self.model_params)
+            expt_util.save_model_summary(model, self.exp_dir, self.run_dir)
         self.model = model
 
     def _compile_model(self):

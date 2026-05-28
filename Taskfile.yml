@@ -32,6 +32,11 @@ tasks:
       - '{{.SSH}} "cd {{.WORK_DIR}} && {{.PYTHON}} tools/fetch_best_config.py"'
       - rsync -avz amd-container:{{.WORK_DIR}}/mainrun/configs/best_config.yaml mainrun/mainrun/configs/
 
+  fetch-ablation-results:
+    desc: "Pull ablation results from remote and organise logs (usage: task fetch-ablation-results -- group1)"
+    cmds:
+      - python tools/fetch_ablation_results.py {{.CLI_ARGS}}
+
   train:
     deps: [checkpoint, download]
     dir: mainrun
@@ -65,7 +70,7 @@ tasks:
       - '{{.SSH}} "cd {{.WORK_DIR}} && {{.PYTHON}} train_hybrid.py --profile {{.CLI_ARGS}}"'
 
   sync:
-    desc: Pull remote experiments and logs to local
+    desc: Pull remote logs to local
     cmds:
       - rsync -avz amd-container:{{.WORK_DIR}}/logs/ mainrun/logs/
 
@@ -112,11 +117,6 @@ tasks:
     desc: "Tail ablation progress on remote"
     cmds:
       - '{{.SSH}} "tail -f {{.WORK_DIR}}/logs/ablation.out"'
-
-  sync-ablation:
-    desc: "Sync ablation results and logs from remote (usage: task sync-ablation -- group1)"
-    cmds:
-      - python tools/sync_ablation.py {{.CLI_ARGS}}
 
   submit:
     deps: [checkpoint]
