@@ -481,9 +481,13 @@ class Trainer:
         tok_s = steps * block_size * batch_size / elapsed
         print(f"\nThroughput: {tok_s:,.0f} tok/s  ({steps} steps, {elapsed:.1f}s)")
 
+        def _cuda_us(e) -> float:
+            # ROCm exposes self_cuda_time_total; CUDA uses cuda_time_total
+            return getattr(e, "cuda_time_total", None) or getattr(e, "self_cuda_time_total", 0)
+
         key_avgs = prof.key_averages()
-        sorted_avgs = sorted(key_avgs, key=lambda e: e.cuda_time_total, reverse=True)
-        total_cuda = sum(e.cuda_time_total for e in key_avgs)
+        sorted_avgs = sorted(key_avgs, key=_cuda_us, reverse=True)
+        total_cuda = sum(_cuda_us(e) for e in key_avgs)
 
         col_w = [48, 7, 12, 7, 10, 12]
         header = ["Op", "Count", "CUDA Total", "CUDA%", "Avg/call", "CPU Total"]
@@ -494,11 +498,12 @@ class Trainer:
         print(fmt.format(*header))
         print("  ".join("-" * w for w in col_w))
         for e in sorted_avgs[:topk]:
-            pct = e.cuda_time_total / total_cuda * 100 if total_cuda > 0 else 0
-            avg_us = e.cuda_time_total / e.count if e.count > 0 else 0
+            cuda_us = _cuda_us(e)
+            pct = cuda_us / total_cuda * 100 if total_cuda > 0 else 0
+            avg_us = cuda_us / e.count if e.count > 0 else 0
             print(fmt.format(
                 e.key[:48], str(e.count),
-                f"{e.cuda_time_total/1e3:.1f}ms", f"{pct:.1f}%",
+                f"{cuda_us/1e3:.1f}ms", f"{pct:.1f}%",
                 f"{avg_us:.0f}us", f"{e.cpu_time_total/1e3:.1f}ms",
             ))
 
