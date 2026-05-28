@@ -137,7 +137,7 @@ tasks:
     deps: [checkpoint]
     cmds:
       - rsync -avz mainrun/configs/ablations.yaml amd-container:{{.WORK_DIR}}/configs/
-      - '{{.SSH}} "cd {{.WORK_DIR}} && nohup {{.PYTHON}} -u ablation.py --group {{.CLI_ARGS}} > logs/ablation.out 2>logs/ablation.err </dev/null & disown"'
+      - '{{.SSH}} "cd {{.WORK_DIR}} && nohup {{.PYTHON}} -u ablation.py --group {{.CLI_ARGS}}"'
 
   ablation-logs:
     desc: "Tail ablation progress on remote"

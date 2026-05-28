@@ -848,8 +848,6 @@ groups:
       n_q_head: 4
       n_kv_heads: 4
       muon_lr: 0.02
-      adamw_lr: 0.0003
-      emb_lr: 0.003
     experiments:
       - name: g12_00_base
         desc: "Control: best config (4E, vocab=10k) — AAAEAAAAAAAEAAAAAAAEAAAAAAAE"
