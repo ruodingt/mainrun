@@ -756,6 +756,7 @@ groups:
       tie_weights: true
       use_token_anchor: true
       vocab_size: 16000
+      layer_pattern: AAAAAAAAAAAAAAAAAAAAAAAAAAAA
       d_model: 256
       n_q_head: 4
       n_kv_heads: 4
@@ -801,3 +802,20 @@ groups:
         desc: "vocab= 16k. 2VE layers at pos 27, 13 - 13AE13AE"
         delta:
           layer_pattern: AAAAAAAAAAAAAEAAAAAAAAAAAAAE
+
+      - name: g11_08_vocab10k
+        desc: "vocab=10k. Control: 28A, vocab=10240, no VE"
+        delta:
+          vocab_size: 10240
+
+      - name: g11_9_vocab10k_5ve_i7
+        desc: "vocab=10k. Control: 28A, vocab=10240, 4VE layers at pos 27, 22, 17, 12, 7, AAAEAAAAAAAEAAAAAAAEAAAAAAAE"
+        delta:
+          vocab_size: 10240
+          layer_pattern: AAAAAAAEAAAAEAAAAEAAAAEAAAAE
+
+      - name: g11_10_vocab10k_4ve_i8
+        desc: "vocab=10k. Control: 28A, vocab=10240, 4VE layers at pos 27, 19, 11, 3, AAAEAAAAAAAEAAAAAAAEAAAAAAAE"
+        delta:
+          vocab_size: 10240
+          layer_pattern: AAAEAAAAAAAEAAAAAAAEAAAAAAAE
