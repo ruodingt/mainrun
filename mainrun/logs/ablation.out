@@ -1,0 +1,58 @@
+
+############################################################
+# [1/2] g12_00_base
+# Control: best config (4E, vocab=10k) — AAAEAAAAAAAEAAAAAAAEAAAAAAAE
+############################################################
+
+============================================================
+  Control: best config (4E, vocab=10k) — AAAEAAAAAAAEAAAAAAAEAAAAAAAE
+============================================================
+
+
+
+Loading config: /home/ubuntu/workspace/mainrun/configs/best_config.yaml
+hyperparameters_configured: layer_pattern=AAAEAAAAAAAEAAAAAAAEAAAAAAAE, vocab_size=10240, d_model=256, dropout=0.1, norm=layernorm, pos_emb=rope, use_rezero=False, use_token_anchor=True, use_resid_scale=False, weight_init=gpt2, tie_weights=True, norm_emb=False, logit_softcap=0.0, mlp_act=swiglu, mlp_expand=4.0, n_q_head=4, n_kv_heads=4, separate_kv=False, use_value_residual=False, use_value_residual_x0=False, use_value_carry=False, ve_gate_channels=12, expand=2, d_head=64, d_state=128, n_groups=1, d_conv=4, chunk_len=64, optimizer_type=muon_adamw, muon_lr=0.02, muon_attn_only=False, mlp_lr=0.0003, adamw_lr=0.0003, emb_lr=0.003, scalar_lr=0.001, adamw_wd=0.1, sgd_lr=0.006, sgd_wd=0.0, lr_schedule=wsd, warmup_frac=0.05, decay_frac=0.6, min_lr_frac=0.05, plateau_factor=0.5, plateau_patience=3, sgdr_t0_frac=0.43, wsd_n_cycles=2, wsd_cycle_lr_decay=1.0, spectral_clip=0.0, batch_size=64, block_size=128, clip_norm_mode=all, device=cuda, use_fa2=True, use_fused_ce=False, use_compile=True, use_bf16=True, evals_per_epoch=1, experiments_dir=./experiments/ablation/group12/g12_00_base, log_file=./logs/mainrun.log, use_tqdm=True, save_weights=False, epochs=7, seed=1337, num_titles=100000, val_frac=0.1, n_layer=28
+device_info: device=cuda
+vocab: 10240
+dataset_info: titles_count=90000, epochs=7, batches_per_epoch=144, tokens_per_epoch=1182033, vocab_size=10240
+model_info: parameters_count=35615452
+[    1/1008] validation_step: loss=2.141480 time=3.42s
+[  144/1008] validation_step: loss=1.404402 time=36.37s
+[  288/1008] validation_step: loss=1.283755 time=68.55s
+[  432/1008] validation_step: loss=1.233323 time=100.73s
+[  576/1008] validation_step: loss=1.205668 time=132.99s
+[  720/1008] validation_step: loss=1.183768 time=165.29s
+[  864/1008] validation_step: loss=1.169902 time=197.68s
+[ 1008/1008] validation_step: loss=1.166166 time=230.14s
+
+############################################################
+# [2/2] g12_01_mamba_first
+# Replace first A with M — MAAEAAAAAAAEAAAAAAAEAAAAAAAE
+############################################################
+
+============================================================
+  Replace first A with M — MAAEAAAAAAAEAAAAAAAEAAAAAAAE
+============================================================
+
+
+
+Loading config: /home/ubuntu/workspace/mainrun/configs/best_config.yaml
+hyperparameters_configured: layer_pattern=MAAEAAAAAAAEAAAAAAAEAAAAAAAE, vocab_size=10240, d_model=256, dropout=0.1, norm=layernorm, pos_emb=rope, use_rezero=False, use_token_anchor=True, use_resid_scale=False, weight_init=gpt2, tie_weights=True, norm_emb=False, logit_softcap=0.0, mlp_act=swiglu, mlp_expand=4.0, n_q_head=4, n_kv_heads=4, separate_kv=False, use_value_residual=False, use_value_residual_x0=False, use_value_carry=False, ve_gate_channels=12, expand=2, d_head=64, d_state=128, n_groups=1, d_conv=4, chunk_len=64, optimizer_type=muon_adamw, muon_lr=0.02, muon_attn_only=False, mlp_lr=0.0003, adamw_lr=0.0003, emb_lr=0.003, scalar_lr=0.001, adamw_wd=0.1, sgd_lr=0.006, sgd_wd=0.0, lr_schedule=wsd, warmup_frac=0.05, decay_frac=0.6, min_lr_frac=0.05, plateau_factor=0.5, plateau_patience=3, sgdr_t0_frac=0.43, wsd_n_cycles=2, wsd_cycle_lr_decay=1.0, spectral_clip=0.0, batch_size=64, block_size=128, clip_norm_mode=all, device=cuda, use_fa2=True, use_fused_ce=False, use_compile=True, use_bf16=True, evals_per_epoch=1, experiments_dir=./experiments/ablation/group12/g12_01_mamba_first, log_file=./logs/mainrun.log, use_tqdm=True, save_weights=False, epochs=7, seed=1337, num_titles=100000, val_frac=0.1, n_layer=28
+device_info: device=cuda
+vocab: 10240
+dataset_info: titles_count=90000, epochs=7, batches_per_epoch=144, tokens_per_epoch=1182033, vocab_size=10240
+model_info: parameters_count=35818484
+[    1/1008] validation_step: loss=2.142056 time=118.76s
+[  144/1008] validation_step: loss=1.325984 time=185.94s
+[  288/1008] validation_step: loss=1.246362 time=224.96s
+[  432/1008] validation_step: loss=1.217564 time=263.96s
+[  576/1008] validation_step: loss=1.199858 time=303.07s
+[  720/1008] validation_step: loss=1.184678 time=342.25s
+[  864/1008] validation_step: loss=1.175097 time=381.92s
+[ 1008/1008] validation_step: loss=1.172637 time=421.14s
+
+============================================================
+Experiment                       val_loss      tok/s       params
+------------------------------------------------------------
+g12_00_base                        1.1662     42,320   35,615,452
+g12_01_mamba_first                 1.1726     24,174   35,818,484
