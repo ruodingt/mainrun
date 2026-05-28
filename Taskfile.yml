@@ -21,11 +21,22 @@ tasks:
     cmds:
       - python3 download_dataset.py
 
+  fetch-best-config:
+    desc: Scan ablation logs and write best_config.yaml (manual trigger)
+    cmds:
+      - python3 tools/fetch_best_config.py
+
+  fetch-best-config-remote:
+    desc: Fetch best config on remote, then sync it locally
+    cmds:
+      - '{{.SSH}} "cd {{.WORK_DIR}} && {{.PYTHON}} tools/fetch_best_config.py"'
+      - rsync -avz amd-container:{{.WORK_DIR}}/mainrun/configs/best_config.yaml mainrun/mainrun/configs/
+
   train:
     deps: [checkpoint, download]
     dir: mainrun
     cmds:
-      - python3 train.py
+      - python3 train_hybrid.py
 
   train-local:
     desc: Run train_hybrid locally (with checkpoint)
@@ -46,6 +57,12 @@ tasks:
     deps: [checkpoint]
     cmds:
       - '{{.SSH}} "cd {{.WORK_DIR}} && nohup {{.PYTHON}} train_hybrid.py > logs/train.out 2>logs/train.err </dev/null & disown"'
+
+  profile-remote:
+    desc: "Profile training on remote with best config (usage: task profile-remote -- --profile-steps 20)"
+    deps: [checkpoint]
+    cmds:
+      - '{{.SSH}} "cd {{.WORK_DIR}} && {{.PYTHON}} train_hybrid.py --profile {{.CLI_ARGS}}"'
 
   sync:
     desc: Pull remote experiments and logs to local
@@ -88,7 +105,7 @@ tasks:
     desc: "Run ablation group on remote in background (usage: task ablation-remote -- group1)"
     deps: [checkpoint]
     cmds:
-      - rsync -avz tools/ablations.yaml amd-container:{{.WORK_DIR}}/tools/
+      - rsync -avz mainrun/configs/ablations.yaml amd-container:{{.WORK_DIR}}/mainrun/configs/
       - '{{.SSH}} "cd {{.WORK_DIR}} && nohup {{.PYTHON}} -u ablation.py --group {{.CLI_ARGS}} > logs/ablation.out 2>logs/ablation.err </dev/null & disown"'
 
   ablation-logs:

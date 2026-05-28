@@ -820,3 +820,11 @@ groups:
         delta:
           vocab_size: 10240
           layer_pattern: AAAEAAAAAAAEAAAAAAAEAAAAAAAE
+
+      - name: g11_11_mlr0025_vocab10k_4ve_i8
+        desc: "muon_lr=0.025; vocab=10k. Control: 28A, vocab=10240, 4VE layers at pos 27, 19, 11, 3, AAAEAAAAAAAEAAAAAAAEAAAAAAAE"
+        delta:
+          vocab_size: 10240
+          layer_pattern: AAAEAAAAAAAEAAAAAAAEAAAAAAAE
+          muon_lr: 0.025
+

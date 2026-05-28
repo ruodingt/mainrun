@@ -1,0 +1,59 @@
+# Best config from logs: mainrun_g11_10_vocab10k_4ve_i8
+# val_loss: 1.1652
+
+# --- Architecture ---
+d_model: 256
+dropout: 0.1
+layer_pattern: AAAEAAAAAAAEAAAAAAAEAAAAAAAE
+logit_softcap: 0.0
+mlp_act: swiglu
+mlp_expand: 4.0
+norm: layernorm
+norm_emb: false
+pos_emb: rope
+tie_weights: true
+use_resid_scale: false
+use_rezero: false
+use_token_anchor: true
+vocab_size: 10240
+weight_init: gpt2
+
+# --- Attention ---
+n_kv_heads: 4
+n_q_head: 4
+separate_kv: false
+use_value_carry: false
+use_value_residual: false
+use_value_residual_x0: false
+ve_gate_channels: 12
+
+# --- Optimizer ---
+adamw_lr: 0.0003
+adamw_wd: 0.1
+emb_lr: 0.003
+mlp_lr: 0.0003
+muon_attn_only: false
+muon_lr: 0.02
+optimizer_type: muon_adamw
+scalar_lr: 0.001
+sgd_lr: 0.006
+sgd_wd: 0.0
+spectral_clip: 0.0
+
+# --- LR Schedule ---
+decay_frac: 0.6
+lr_schedule: wsd
+min_lr_frac: 0.05
+warmup_frac: 0.05
+
+# --- Training ---
+batch_size: 64
+block_size: 128
+clip_norm_mode: all
+
+# --- Other ---
+plateau_factor: 0.5
+plateau_patience: 3
+sgdr_t0_frac: 0.43
+wsd_cycle_lr_decay: 1.0
+wsd_n_cycles: 2

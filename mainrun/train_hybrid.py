@@ -340,7 +340,8 @@ class Trainer:
                     alloc_gb = reserved_gb = max_alloc_gb = 0.0
 
                 self.logger.log("training_step", step=step, max_steps=self.max_steps,
-                                loss=loss.item(), elapsed_time=elapsed, prnt=False)
+                                loss=loss.item(), elapsed_time=elapsed,
+                                avg_tok_s=round(avg_tok_s), prnt=False)
 
                 if self.tb_writer:
                     tb = self.tb_writer
@@ -417,6 +418,98 @@ class Trainer:
 
     # ------------------------------------------------------------------
 
+    def profile(self, warmup: int = 3, steps: int = 10, output: str = "profile_out", topk: int = 20):
+        """Profile `steps` training steps after `warmup` warmup steps using torch.profiler."""
+        from torch.profiler import profile as tprofile, record_function, ProfilerActivity
+        import os as _os
+
+        self._setup_data()
+        self._build_model()
+        self._build_optimizer()
+        self._compile_model()
+
+        device = self.device
+        amp_ctx = torch.amp.autocast(device_type=device, dtype=torch.bfloat16) \
+            if self.args.runtime.use_bf16 else contextlib.nullcontext()
+        block_size = self.args.train.block_size
+        batch_size = self.args.train.batch_size
+        ptr = 0
+
+        def _step():
+            nonlocal ptr
+            xb, yb, ptr = get_batch(self.train_ids, ptr, block_size, batch_size, device)
+            self.opt.zero_grad(set_to_none=True)
+            with amp_ctx:
+                with record_function("forward"):
+                    _, loss = self.model(xb, yb)
+            with record_function("backward"):
+                loss.backward()
+            with record_function("optimizer_step"):
+                self.opt.step()
+            if device == "cuda":
+                torch.cuda.synchronize()
+            return loss.item()
+
+        self.model.train()
+        print(f"Profiler: {warmup} warmup + {steps} profile steps")
+        print(f"  model: {self.model_params/1e6:.1f}M params  device: {device}")
+        for _ in range(warmup):
+            _step()
+        print("  warmup done")
+
+        _os.makedirs(output, exist_ok=True)
+        activities = [ProfilerActivity.CPU]
+        if device == "cuda":
+            activities.append(ProfilerActivity.CUDA)
+        torch.cuda.reset_peak_memory_stats()
+        t0 = time.time()
+
+        with tprofile(
+            activities=activities,
+            record_shapes=False,
+            with_stack=False,
+            profile_memory=True,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(output),
+        ) as prof:
+            for _ in range(steps):
+                _step()
+                prof.step()
+
+        elapsed = time.time() - t0
+        tok_s = steps * block_size * batch_size / elapsed
+        print(f"\nThroughput: {tok_s:,.0f} tok/s  ({steps} steps, {elapsed:.1f}s)")
+
+        key_avgs = prof.key_averages()
+        sorted_avgs = sorted(key_avgs, key=lambda e: e.cuda_time_total, reverse=True)
+        total_cuda = sum(e.cuda_time_total for e in key_avgs)
+
+        col_w = [48, 7, 12, 7, 10, 12]
+        header = ["Op", "Count", "CUDA Total", "CUDA%", "Avg/call", "CPU Total"]
+        fmt = "  ".join(f"{{:<{w}}}" for w in col_w)
+        print(f"\n{'='*72}")
+        print(f"Top-{topk} ops by CUDA self time")
+        print(f"{'='*72}")
+        print(fmt.format(*header))
+        print("  ".join("-" * w for w in col_w))
+        for e in sorted_avgs[:topk]:
+            pct = e.cuda_time_total / total_cuda * 100 if total_cuda > 0 else 0
+            avg_us = e.cuda_time_total / e.count if e.count > 0 else 0
+            print(fmt.format(
+                e.key[:48], str(e.count),
+                f"{e.cuda_time_total/1e3:.1f}ms", f"{pct:.1f}%",
+                f"{avg_us:.0f}us", f"{e.cpu_time_total/1e3:.1f}ms",
+            ))
+
+        if device == "cuda":
+            alloc = torch.cuda.max_memory_allocated() / 1e9
+            rsvd  = torch.cuda.max_memory_reserved() / 1e9
+            print(f"\nPeak memory: {alloc:.2f} GB allocated  /  {rsvd:.2f} GB reserved")
+
+        print(f"\nTrace → {output}/")
+        print(f"  TensorBoard: tensorboard --logdir {output}")
+
+    # ------------------------------------------------------------------
+
     def run(self):
         self._setup_experiment()
         self._setup_data()
@@ -429,19 +522,48 @@ class Trainer:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import json, sys
+    import argparse, json, sys
     os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
     os.environ["TORCH_BLAS_PREFER_HIPBLASLT"] = "0"
 
+    parser = argparse.ArgumentParser()
+    parser.add_argument("overrides", nargs="?", default=None,
+                        help="JSON string of flat hparam overrides, e.g. '{\"muon_lr\": 0.01}'")
+    parser.add_argument("--config", default="configs/best_config.yaml",
+                        help="YAML config file (default: configs/best_config.yaml)")
+    parser.add_argument("--profile", action="store_true",
+                        help="Run profiler instead of full training")
+    parser.add_argument("--profile-steps",  type=int, default=10)
+    parser.add_argument("--profile-warmup", type=int, default=3)
+    parser.add_argument("--profile-output", type=str, default="profile_out")
+    parser.add_argument("--profile-topk",   type=int, default=20)
+    cli = parser.parse_args()
+
     args = Hyperparameters()
-    if len(sys.argv) > 1:
-        args.update_from_flat(json.loads(sys.argv[1]))
+    import yaml
+    from pathlib import Path
+    config_path = Path(cli.config)
+    assert config_path.exists(), f"config not found: {config_path}"
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+    args.update_from_flat({k: v for k, v in cfg.items() if not str(k).startswith("#")})
+    if cli.overrides:
+        args.update_from_flat(json.loads(cli.overrides))
+
     torch.manual_seed(args.fixed.seed)
     random.seed(args.fixed.seed)
 
     trainer = Trainer(args)
     try:
-        trainer.run()
+        if cli.profile:
+            trainer.profile(
+                warmup=cli.profile_warmup,
+                steps=cli.profile_steps,
+                output=cli.profile_output,
+                topk=cli.profile_topk,
+            )
+        else:
+            trainer.run()
     finally:
         if trainer.logger and hasattr(trainer.logger, 'file_handler'):
             trainer.logger.file_handler.close()

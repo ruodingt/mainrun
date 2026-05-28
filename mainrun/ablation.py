@@ -1,5 +1,5 @@
 """
-Ablation study runner. Configs live in tools/ablations.yaml.
+Ablation study runner. Configs live in configs/ablations.yaml.
 
 Config resolution per experiment: root base → group_base → delta.
 
@@ -19,7 +19,7 @@ from pathlib import Path
 import yaml
 from hparams import Hyperparameters
 
-YAML_PATH = Path(__file__).parent.parent / "tools" / "ablations.yaml"
+YAML_PATH = Path(__file__).parent / "configs" / "ablations.yaml"
 EXPERIMENTS_DIR = "./experiments/ablation"
 
 

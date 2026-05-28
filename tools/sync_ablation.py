@@ -28,7 +28,7 @@ ROOT = Path(__file__).parent.parent
 LOCAL_ABLATION = ROOT / "mainrun" / "experiments" / "ablation"
 LOCAL_HYPERTUNE_FULL = ROOT / "mainrun" / "experiments" / "hypertune-full"
 LOCAL_LOGS = ROOT / "mainrun" / "logs"
-YAML_PATH = Path(__file__).parent / "ablations.yaml"
+YAML_PATH = Path(__file__).parent.parent / "mainrun" / "configs" / "ablations.yaml"
 
 
 def rsync_ablation():
