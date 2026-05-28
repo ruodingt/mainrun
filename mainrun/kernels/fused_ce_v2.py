@@ -82,7 +82,7 @@ def _fused_ce_kernel(
 
         logits = tl.dot(xbf16, tl.trans(wbf16))
         if logit_softcap != 0.0:
-            logits = logit_softcap * tl.math.tanh(logits / logit_softcap)
+            logits = logit_softcap * 2.0 * tl.sigmoid(2.0 * (logits / logit_softcap)) - 1.0
         logits = tl.where(v_mask[None, :], logits, -float('inf'))
 
         m_new = tl.maximum(m_i, tl.max(logits, axis=1))
@@ -107,7 +107,7 @@ def _fused_ce_kernel(
 
         logits = tl.dot(xbf16, tl.trans(wbf16))
         if logit_softcap != 0.0:
-            z      = logit_softcap * tl.math.tanh(logits / logit_softcap)
+            z      = logit_softcap * 2.0 * tl.sigmoid(2.0 * (logits / logit_softcap)) - 1.0
             p      = tl.exp(z - m_i[:, None]) / s_i[:, None]
             is_tgt = v_idx[None, :] == targets[:, None]
             g_z    = (p - tl.where(is_tgt, 1.0, 0.0)) * inv_n

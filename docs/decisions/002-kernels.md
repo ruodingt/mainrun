@@ -11,43 +11,46 @@ Migration Target: MI355X (gfx942, CDNA3, 228 CU, 64KB LDS, ~5.3 TB/s HBM3)
 **Tests:** `kernels/tests/test_rms_norm.py`
 
 ### Results
+
+Benchmark shape: `(128, 64, 384)` bfloat16
+
 | | Speed |
 |---|---|
-| `nn.RMSNorm` | Baseline |
-| Triton (default num_warps=4) | 1.86x |
-| Triton + autotune | **3.99x** |
-
-autotune selected fwd `num_warps=2`, bwd `num_warps=1`. RMSNorm is a small kernel, fewer warps → higher occupancy → faster.
+| `nn.RMSNorm` (91.3 μs) | 1.0x |
+| Triton + autotune (49.7 μs) | **1.84x** |
 
 ### Key Decisions
-- `BLOCK = next_power_of_2(N)`, must cover the entire row for reduction, cannot be chunked, not included in autotune config
-- `num_warps` is the only meaningful tuning dimension
-- dw (weight gradient) reduction is left to PyTorch (`dy * x * rstd` sum over rows), fast enough, not worth writing into the kernel
+- `BLOCK = next_power_of_2(N)`, must cover the entire row for reduction, cannot be chunked
+- `num_warps` is the only meaningful tuning dimension; autotune selected fwd `num_warps=2`, bwd `num_warps=1`
+- dw gradient reduction left to PyTorch — fast enough, not worth writing into kernel
 
 ### Current Status
-**Enabled**: `_make_norm()` directly returns `TritonRMSNorm`, replacing `nn.RMSNorm`.
+**Kernel available but not used in final config.** Ablation (g3_01) showed RMSNorm vs LayerNorm is neutral at this scale; final architecture uses `norm: layernorm`. Re-evaluate if switching to RMSNorm.
 
 ---
 
 ## 2. RoPE
 
-**File:** `rope.py` (kernel defined in file, not independent under kernels/)
+**File:** `rope.py`
 **Tests:** `kernels/tests/test_rope.py`
 
 ### Results
+
+Benchmark shape: `B=64, H=4, T=128, D=64` (actual training config, bfloat16 fwd+bwd)
+
 | | Speed (fwd+bwd) |
 |---|---|
-| Native PyTorch | Baseline |
-| Triton fwd+bwd | 0.65x (Slower) |
+| Native PyTorch (283.4 μs) | 1.0x |
+| Triton (246.9 μs) | **1.15x** |
+
+Note: earlier result of **0.65x** was measured at wrong shape (B=128, H=6, T=64, D=64). At the correct training shape, Triton is faster.
 
 ### Key Decisions
-- Forward kernel originally only had forward, no backward → forced to use native during training
-- **Backward implementation**: The rotation matrix is an orthogonal matrix, inverse = transpose = run the same kernel with `-sin`. `dx = kernel(dy, cos, -sin)`, diff = 0 (exact)
-- Root cause of Triton being slower: tensor is too small (B=128, H=6, T=64, D=64), kernel launch overhead > compute
-- autotune **not worth adding**: cannot solve the root problem of launch overhead
+- Backward: rotation matrix is orthogonal → inverse = transpose = same kernel with `-sin`. Exact, diff = 0.
+- At correct training shape, Triton wins by 1.15x — kernel launch overhead is less dominant with T=128 vs T=64.
 
 ### Current Status
-**Not Enabled**: `apply_rotary_emb` uses the native path. `_RoPEFn` is kept in the code, correctness verified, waiting to be evaluated when migrating to MI355X or with longer sequences.
+**Not Enabled** — discovered faster only after correcting benchmark shape. Time budget didn't allow re-integration and re-validation. `_RoPEFn` is in code and correct; enabling requires swapping one line in `rope.py`.
 
 ---
 
@@ -57,55 +60,46 @@ Two versions, different design philosophies.
 
 ### v1 (Python chunking)
 **File:** `kernels/fused_ce.py`
-**Tests:** `kernels/tests/test_fused_ce.py`
 
-- Chunk at the Python layer, each chunk calls torch matmul + Triton CE kernel (in-place grad_logits write)
-- Avoids the full [BT, V] tensor falling to DRAM
-- Benchmark is fwd-only compared to fwd+bwd: **0.38x** (unfair comparison, actually 3x matmul workload vs 1x)
+- Python-level chunking; matmul done by torch, CE kernel overwrites logits with grad_logits
+- `[chunk, V]` still hits DRAM; benchmark fwd-only vs fwd+bwd: **0.38x** (unfair comparison)
 
 ### v2 (tl.dot true kernel fusion)
 **File:** `kernels/fused_ce_v2.py`
 **Tests:** `kernels/tests/test_fused_ce_v2.py`
 
-matmul is written into the Triton kernel, the [BT, V] logits tensor does not exist anywhere.
+matmul lives inside the Triton kernel. The `[BT, V]` logit tensor never exists anywhere.
 
 #### Algorithm
 ```
-pass 1: scan V, tl.dot compute logits tile → online softmax (m_new = max(m, m_tile), s_new = s*exp(m-m_new) + sum(exp(x-m_new))) + collect target logit
-pass 2: recompute logits tile → softmax → grad_logits → grad_x (local) + grad_W (atomic_add)
+pass 1: tl.dot → logits tile → online softmax + collect target logit
+pass 2: tl.dot → logits tile → softmax → grad_x (local) + grad_W (atomic_add)
 ```
-
-logits are computed twice (the unavoidable cost of not storing [BT,V]).
+logits recomputed in pass 2 (cheaper than spilling `[BLOCK_M, V]` to DRAM).
 
 #### Hardware Limitations (gfx1151)
-- RDNA4 WMMA only accepts 16-bit input + fp32 accumulation, **no fp32×fp32 matmul path**
-  → dot inputs must be cast to bf16 (range = fp32 8-bit exponent, won't overflow)
-- LDS = 64KB, w_tile [BLOCK_V, BLOCK_H] bf16 occupies `BLOCK_V × 512 × 2` bytes
-  → BLOCK_V=64 maxes out 64KB, actual limit BLOCK_V ≤ 32, autotune selected **BLOCK_V=16**
-- grad_x accumulator [16, 512] fp32 = 256 VGPRs/thread (RDNA4 limit), num_stages=1
+- RDNA4 WMMA: 16-bit input only → dot inputs cast to bf16
+- LDS 64KB → BLOCK_V ≤ 32; autotune selected **BLOCK_V=16**
+- grad_x accumulator `[16, H]` fp32 = 256 VGPRs/thread → occupancy=1
 
-#### Autotune Results
-| | fwd+bwd Speed | Peak Memory |
-|---|---|---|
-| Standard CE | 198ms (1.0x) | 990MB |
-| v2 Manual BLOCK_V=32 | 618ms (0.33x) | 235MB |
-| v2 autotuned | **313ms (0.63x)** | **235MB** |
+#### Results
 
-autotune selected `BLOCK_M=16, BLOCK_V=16, num_warps=4, num_stages=1`.
+Full training step benchmark (B=64, T=128, V=10240, d=256, L=28):
 
-#### Why is it still slower than standard?
-- Standard fwd+bwd = 3 large GEMMs (logits, grad_x, grad_W)
-- v2 = 3 full GEMMs + 1 cache-hot partial GEMM (pass 2 "recomputes logits" but only reads x and W without writing out the full [BT, V] tensor).
-- If v2 is 313ms vs 198ms (1.58x), the gap to the theoretical ~1.33x is likely RDNA WMMA utilization limits rather than pure instruction counts. (maybe?)
-- **atomic_add vs occupancy**: We previously suspected 512 programs competing on `atomic_add` was the bottleneck. However, atomic conflicts are cache-line based, not program based. It is highly probable that the 256 VGPR requirement for the `grad_x` accumulator is crushing occupancy down to 1, acting as the true bottleneck.
+| | ms/step | Peak Memory | Speedup |
+|---|---|---|---|
+| Standard CE | 1619 ms | 7109 MB | 1.0x |
+| Fused CE v2 | 1559 ms | 5815 MB | **1.04x** |
+| Memory savings | | | **1.22x** |
 
-#### 3-kernel design (abandoned after discussion)
-Proposal: Kernel1 (loss) + Kernel2 (grad_x) + Kernel3 (grad_W) to eliminate atomic.
-**Reason for abandonment**: logits would be computed 3 times instead of 2, one extra full W scan, net negative return.
+Note: measured without `torch.compile` or operator fusion — reference only. CE kernel contribution is diluted by all other ops; real compiled training impact requires rocprof comparison.
+
+#### Why is CE kernel still slower in isolation?
+- 256 VGPRs for grad_x accumulator crushes occupancy to 1 on RDNA4
+- Standard CE = 3 large GEMMs via rocBLAS (optimal tile selection); v2 = custom tiled loop
 
 ### Current Status
-**Optionally Enabled**: `use_fused_ce=True` in `Hyperparameters` (Default False).
-Primary value is in **Memory** (4.21x), speed-wise gfx1151 doesn't have an advantage.
+**Optionally enabled** (`use_fused_ce=True`, default False). Primary value is **memory (1.22x)**, which could allow larger batch size. Speed benefit at full-step level is marginal (1.04x).
 
 ---
 
@@ -113,11 +107,11 @@ Primary value is in **Memory** (4.21x), speed-wise gfx1151 doesn't have an advan
 
 | Operation | File | Description |
 |---|---|---|
-| Uncomment CDNA3 configs | `kernels/fused_ce_v2.py` L17-21 | BLOCK_V=64/128, num_stages=2 |
-| Remove bf16 cast | `kernels/fused_ce_v2.py` | MFMA supports fp32 dot, but throughput is often 1/4 to 1/2 of bf16/fp16. **Recommendation:** Keep both configs and let autotune decide. |
-| Re-evaluate RMSNorm baseline | `kernels/rms_norm.py` | CDNA3 PyTorch baseline (via hipBLASLt/CK) will be much stronger. The current 4x speedup may drop to 1.5-2x. |
-| Evaluate RoPE Triton | `rope.py` | HBM3 bandwidth 18x, might turn the tables at large T |
-| Rerun autotune | All kernels | Run automatic search on new hardware for the first time |
+| Uncomment CDNA3 configs | `kernels/fused_ce_v2.py` L34-39 | BLOCK_V=64/128, num_stages=2 |
+| Keep bf16 cast or autotune | `kernels/fused_ce_v2.py` | MFMA supports fp32 but bf16 throughput often 2-4x higher; let autotune decide |
+| Re-evaluate RMSNorm | `kernels/rms_norm.py` | CDNA3 baseline much stronger; 1.84x may drop |
+| Enable RoPE Triton | `rope.py` | Already 1.15x on gfx1151; HBM3 bandwidth likely widens gap |
+| Rerun autotune | All kernels | Cold run on new hardware |
 
 ---
 
@@ -125,16 +119,17 @@ Primary value is in **Memory** (4.21x), speed-wise gfx1151 doesn't have an advan
 
 | Kernel | Source of Error | Max Error |
 |---|---|---|
-| RMSNorm fwd (fp32) | Triton tl.sum accumulation order | ~1e-6 |
+| RMSNorm fwd (fp32) | tl.sum accumulation order | ~1e-6 |
 | RMSNorm fwd (bf16) | bf16 precision | ~8e-3 |
 | RoPE fwd (fp32) | None (exact) | ~2e-7 |
-| RoPE bwd | None (exact, same kernel) | 0.00 |
+| RoPE bwd | None (exact, same kernel with -sin) | 0.00 |
 | Fused CE fwd | bf16 matmul vs fp32 ref | ~5e-3 |
 | Fused CE bwd dx/dW | bf16 accumulation order across tiles | ~2e-3 |
 
 ---
 
-## 6. TODOs / Next Steps
+## 6. TODOs
 
-- **Fused CE "Tokens/Sec at same budget" test**: Run an experiment measuring actual throughput. If the 4.2x memory savings allows us to increase batch size and ultimately wins on `tokens/sec`, flip `use_fused_ce` default to `True`.
-- **Profile Fused CE on gfx1151**: Run `rocprof` to check the `SQ_INSTS_VALU` vs `SQ_INSTS_LDS` ratio to definitively confirm if the bottleneck is `atomic_add` conflicts or VGPR-induced low occupancy.
+- **Enable RoPE Triton**: swap `_apply_rope_native` → `_RoPEFn.apply` in `rope.py`. Correctness verified, 1.15x faster at training shape.
+- **Fused CE batch-size scaling test**: 1.22x memory savings → can increase batch size → measure net tok/s gain.
+- **Profile Fused CE with rocprof**: run `task rocprof-remote` with `use_fused_ce=True` to confirm VGPR occupancy bottleneck via `SQ_INSTS_VALU` ratio.

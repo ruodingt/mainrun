@@ -2,7 +2,7 @@
 
 **Goal:** Minimise validation loss on Hacker News titles (100k, 7 epochs, seed=1337).
 **Baseline:** SGD + cosine LR + learned pos emb + GELU + 6L×512d×16000 → **val_loss = 1.7319**
-**Final best:** 28L×256d×16000 + Muon+AdamW + WSD + RoPE + SwigLU + tie_weights + token_anchor → **val_loss = 1.1696**
+**Final best:** 28L×256d×10240 + Muon+AdamW + WSD + RoPE + SwigLU + tie_weights + token_anchor → **val_loss = 1.1652**
 
 ---
 
@@ -49,7 +49,7 @@
 | `layer_pattern` | `"A"*6` | `"A"*28` | Sequence of layer types: `"A"`=Attention, `"M"`=Mamba. Length = `n_layer`. Pure transformer = `"A"*N`. |
 | `d_model` | 512 | 256 | Residual stream width (hidden dimension). |
 | `n_q_head` / `n_kv_heads` | 8 / 8 | 4 / 4 | Query / key-value head counts. `n_kv_heads=n_q_head` → MHA; `n_kv_heads=1` → MQA; in between → GQA. |
-| `vocab_size` | 16000 | 16000 | BPE vocabulary size (8k or 16k). |
+| `vocab_size` | 16000 | 10240 | BPE vocabulary size (8k or 16k). |
 | `mlp_act` | `gelu` | `swiglu` | MLP activation: `gelu` (baseline), `relu_sq` (ReLU²), `swiglu` (SwiGLU with gated projection). |
 | `tie_weights` | `False` | `True` | Share token embedding and lm_head weight matrices. Reduces params by `vocab_size × d_model`. |
 | `pos_emb` | `learned` | `rope` | Positional encoding: `learned` (absolute, per-position) or `rope` (Rotary Position Embedding, applied to Q and K). |
@@ -64,9 +64,9 @@
 
 | Param | Baseline | Final best | Description |
 |---|---|---|---|
-| `use_value_residual` | — | `False` | Add current-layer input to value projections before attention: `v += x` (reshaped to head dims). Requires MHA (`n_kv_heads == n_q_head`). |
-| `use_value_residual_x0` | — | `False` | Add original token embedding to value projections: `v += x₀`. Injects raw token identity deep into attention values. |
-| `use_value_carry` | — | `False` | Cross-layer value carry: `v_l = Wv(x) + λ * v_{l-1}`, where `λ` is a learnable scalar initialised to 0. Passes the previous layer's value tensor forward. |
+| `use_value_residual` | `False` | `False` | Add current-layer input to value projections before attention: `v += x` (reshaped to head dims). Requires MHA (`n_kv_heads == n_q_head`). |
+| `use_value_residual_x0` | `False` | `False` | Add original token embedding to value projections: `v += x₀`. Injects raw token identity deep into attention values. |
+| `use_value_carry` | `False` | `False` | Cross-layer value carry: `v_l = Wv(x) + λ * v_{l-1}`, where `λ` is a learnable scalar initialised to 0. Passes the previous layer's value tensor forward. |
 
 ### Optimiser
 
@@ -240,58 +240,208 @@ Three variants tested: v += x (current-layer residual), v += x₀ (original embe
 
 ## Group 10 — Vocab Size & Architecture Variants (28L×256d)
 
-Sweeping vocab size around the 16k optimum, plus architecture experiments.
-
 **Key findings:**
 - vocab=10240 beats 16k (−0.004); 8k and 12k both hurt
-- `separate_kv`: splits fused kv_proj into k_proj+v_proj; +5% tok/s, neutral loss
+- `separate_kv`: splits fused kv\_proj into square k\_proj+v\_proj; +5% tok/s, neutral loss
 - `spectral_clip`: −19% tok/s, no loss benefit — dropped
-- `muon_attn_only`: routes MLP matrices to AdamW instead of Muon — catastrophic (+0.041)
-- Smaller MLP (hidden=512/384): −27%/−45% params, +0.003/+0.004 loss — MLP has compression headroom but at a cost
+- `muon_attn_only`: routes MLP matrices to AdamW — catastrophic (+0.041); Muon is essential for MLP
+- Smaller MLP (hidden=512/384): −27%/−45% params, slight loss increase — compression headroom exists but costs quality
 
 | Config | val_loss | Δ vs base | tok/s | Params |
 | --- | --- | --- | --- | --- |
 | 28L×256d, vocab=16k (base) | 1.1700 | +0.0000 | 40,991 | 26.6M |
-| **vocab=10240** ✓ | 1.1660 | −0.0040 | 37,430 | 25.1M |
-| vocab=12288 | 1.2016 | +0.0316 | 36,788 | 25.7M |
-| vocab=8192 | 1.1937 | +0.0237 | 38,085 | 24.6M |
-| separate_kv, vocab=10k | 1.1668 | −0.0032 | 43,205 | 25.1M |
-| spectral_clip, vocab=10k | 1.1673 | −0.0027 | 33,219 | 25.1M |
-| muon_attn_only | 1.2106 | +0.0406 | 44,997 | 25.1M |
-| MLP hidden=512 (mlp_expand=3.0) | 1.1687 | −0.0013 | 40,890 | 21.0M |
-| MLP hidden=384 (mlp_expand=2.25) | 1.1697 | −0.0003 | 43,831 | 18.2M |
+| **vocab=10240** ✓ | 1.1660 | -0.0040 | 37,430 | 25.13M |
+| vocab=12288 | 1.2016 | +0.0316 | 36,788 | 25.65M |
+| vocab=8192 | 1.1937 | +0.0237 | 38,085 | 24.61M |
+| separate_kv, vocab=10k | 1.1668 | -0.0032 | 43,205 | 25.13M |
+| spectral_clip=1.0, vocab=10k | 1.1673 | -0.0027 | 33,219 | 25.13M |
+| muon_attn_only (MLP→AdamW) | 1.2106 | +0.0406 | 44,997 | 25.13M |
+| MLP hidden=512 (mlp_expand=3.0) | 1.1687 | -0.0013 | 40,890 | 21.0M |
+| MLP hidden=384 (mlp_expand=2.25) | 1.1697 | -0.0003 | 43,831 | 18.25M |
 
 ---
 
-## Group 11 — Value Embeddings (ResFormer-style E layers)
+## Group 11 — Value Embeddings / E Layers (ResFormer-style)
 
-Dedicated per-layer embedding tables injected into V via a learned per-head gate: `v += 3·σ(gate(x[:12])) * ve_table(idx)`. Controlled by `layer_pattern` — `E` = attention with value embedding, `A` = standard attention. Value embed tables are separate from `token_emb` and use `emb_lr`.
+Dedicated per-layer embedding tables injected into V via a learned per-head gate:
+`v += 3·σ(Linear(x[:12])) * ve_table(idx)`. Layer type `E` in `layer_pattern` enables this;
+embedding tables are separate from `token_emb`, optimised with `emb_lr`.
 
 **Key findings:**
-- VE helps more with vocab=16k than vocab=10k (larger vocab → more token identity information to inject)
-- With vocab=10k, 4E layers at interval 8 is the sweet spot: −0.0008 vs no-VE baseline
-- 5E layers over-saturates (worse)
-- Gate channels (12 vs 16) make no meaningful difference
-- Cost: +10.5M params (+42%) for −0.0008 loss
+- VE helps more with vocab=16k than vocab=10k — larger vocab has more token identity signal to inject
+- With vocab=10k: 4E at interval=8 is the sweet spot (−0.0008 vs no-VE baseline)
+- 5E over-saturates; gate_channels (12 vs 16) makes no meaningful difference
+- Cost: +10.5M params (+42%) for −0.0008 loss gain
 
-**vocab=16k experiments** (base: g10_00_base 1.1700):
+**vocab=16k** (Δ vs g10\_00\_base = 1.1700):
 
-| Config | val_loss | Δ vs base | tok/s | Params |
+| Config | val_loss | Δ vs 16k base | tok/s | Params |
 | --- | --- | --- | --- | --- |
-| 28L all-A, vocab=16k (base) | 1.1700 | +0.0000 | 40,991 | 26.6M |
-| 2E layers | 1.1708 | +0.0008 | 35,754 | 34.8M |
-| 3E layers | 1.1691 | −0.0009 | 35,472 | 38.9M |
-| 4E layers | 1.1698 | +0.0002 | 34,943 | 43.0M |
-| 2E, gate_ch=16 | 1.1700 | +0.0000 | 35,653 | 34.8M |
+| 2E layers (pos 9,19) | 1.1708 | +0.0008 | 35,754 | 34.8M |
+| 3E layers (pos 9,18,27) | 1.1691 | -0.0009 | 35,472 | 38.89M |
+| 2E layers, gate_ch=16 | 1.1700 | +0.0000 | 35,653 | 34.8M |
+| 4E layers | 1.1698 | -0.0002 | 34,943 | 42.99M |
 
-**vocab=10k experiments** (base: g10_01 1.1660):
+**vocab=10k** (Δ vs g10\_01 = 1.1660):
 
-| Config | val_loss | Δ vs base | tok/s | Params |
+| Config | val_loss | Δ vs 10k base | tok/s | Params |
 | --- | --- | --- | --- | --- |
-| 28L all-A, vocab=10k (base) | 1.1660 | +0.0000 | 37,430 | 25.1M |
-| 3E layers | 1.1657 | −0.0003 | 42,148 | 33.0M |
-| **4E layers, interval=8** ✓ | **1.1652** | **−0.0008** | 36,470 | 35.6M |
-| 5E layers, interval=7 | 1.1672 | +0.0012 | 36,735 | 38.2M |
+| 28A, no VE (baseline) | 1.1659 | -0.0001 | 43,003 | 25.13M |
+| 3E layers | 1.1657 | -0.0003 | 42,148 | 32.99M |
+| **4E layers, interval=8** ✓ | 1.1652 | -0.0008 | 36,470 | 35.62M |
+| 5E layers, interval=7 | 1.1672 | +0.0012 | 36,735 | 38.24M |
+| 4E, muon_lr=0.025 | 1.1658 | -0.0002 | 42,050 | 35.62M |
+
+---
+
+## Appendix — Custom Kernel Benchmarks
+
+Hardware: AMD Ryzen AI MAX+ 395, gfx1151 (RDNA4), 40 CU, ~300 GB/s unified memory.
+
+### RMSNorm (Triton)
+
+Benchmark shape: `(128, 64, 384)` bfloat16.
+
+| Implementation | Speed |
+|---|---|
+| `nn.RMSNorm` (91.3 μs) | 1.0x |
+| Triton + autotune (49.7 μs) | **1.84x** |
+
+autotune selected: fwd `num_warps=2`, bwd `num_warps=1`.
+**Status: Not used in final config** — final architecture uses `layernorm` (ablation g3_01 showed neutral vs rmsnorm).
+
+### RoPE (Triton)
+
+Benchmark shape: `B=64, H=4, T=128, D=64` (actual training config), bfloat16 fwd+bwd.
+
+| Implementation | Speed (fwd+bwd) |
+|---|---|
+| Native PyTorch (283.4 μs) | 1.0x |
+| Triton (246.9 μs) | **1.15x** |
+
+**Status: Not enabled** — discovered faster only after correcting benchmark shape late in the project. Correctness verified; enabling requires one line change in `rope.py`.
+
+### Fused Linear + Cross-Entropy (v2)
+
+True kernel fusion: matmul written inside the Triton kernel; `[BT, V]` logit tensor never materialised.
+Two-pass algorithm: (1) online softmax + collect target logit; (2) recompute logits → grad\_x + grad\_W.
+
+Full training step benchmark (B=64, T=128, V=10240, d=256, L=28):
+
+| Implementation | ms/step | Peak Memory |
+|---|---|---|
+| Standard CE | 1619 ms (1.0x) | 7109 MB |
+| Fused CE v2, autotuned | **1559 ms (1.04x)** | **5815 MB (1.22x savings)** |
+
+Note: full-step times measured without `torch.compile` or operator fusion — reference only, not representative of compiled training performance. CE kernel contribution is diluted by all other ops.
+Bottleneck in isolation: 256 VGPRs for `grad_x` accumulator crushes occupancy to 1 on RDNA4.
+RDNA4 WMMA only supports 16-bit input → bf16 cast required.
+**Status: Optional** (`use_fused_ce=True`). Primary value is memory savings; speed advantage expected on MI355X.
+
+---
+
+## Appendix — GPU Profiling
+
+### Profile Report
+
+**Date:** 2026-05-28 13:08  
+**Config:** `AAAEAAAAAAAEAAAAAAAEAAAAAAAE`  
+**Model:** 35.6M params, 28L × 256d, vocab=10240  
+**Throughput:** 35,310 tok/s  
+
+### Graph Breaks
+
+| | |
+|---|---|
+| Graphs | 1 |
+| Breaks | 0 |
+
+### Memory
+
+| | GB |
+|---|---|
+| Allocated (peak) | 4.18 |
+| Reserved (peak)  | 6.45 |
+
+### GPU Bubble Analysis
+
+> ROCm: hipDeviceSynchronize used as GPU busy proxy
+
+| | ms | % |
+|---|---|---|
+| Wall time | 2320.1 | 100% |
+| GPU busy  | 1002.8 | 43.2% |
+| Bubble    | 1317.2 | 56.8% |
+
+### Top CPU-Dispatch Overhead
+
+| Op | Count | CPU time | per call |
+|---|---|---|---|
+| `backward` | 10 | 316.5ms | 31649µs |
+| `autograd::engine::evaluate_function: CompiledFunctionBackwar` | 10 | 292.6ms | 29257µs |
+| `CompiledFunctionBackward` | 10 | 291.1ms | 29108µs |
+| `## Call CompiledFxGraph fbvcwuqulrovfujd7iuc223hzjvp3lnu3ph7` | 10 | 285.0ms | 28501µs |
+| `optimizer_step` | 10 | 233.7ms | 23373µs |
+| `Optimizer.step#MuonAdamW.step` | 10 | 233.4ms | 23341µs |
+| `forward` | 10 | 178.0ms | 17799µs |
+| `Torch-Compiled Region: 0/0` | 10 | 177.1ms | 17711µs |
+| `CompiledFunction` | 10 | 174.0ms | 17398µs |
+| `## Call CompiledFxGraph fol3rwx4wrgfnytmdj2va37jd23ploz2a7vu` | 10 | 170.1ms | 17014µs |
+| `aten::mm` | 5190 | 162.7ms | 31µs |
+| `hipModuleLaunchKernel` | 12240 | 147.0ms | 12µs |
+| `Torch-Compiled Region: 2/2` | 1140 | 99.8ms | 88µs |
+| `## Call CompiledFxGraph fbmxl54y4yvqkz2ubnufvdfv4ujzt3fo5sf7` | 1140 | 78.8ms | 69µs |
+| `hipExtModuleLaunchKernel` | 5830 | 78.1ms | 13µs |
+| `triton_poi_fused_add_copy__div_lerp_mul_neg_pow_rsub_sqrt_0` | 1240 | 47.3ms | 38µs |
+| `aten::_scaled_dot_product_flash_attention_backward` | 280 | 32.9ms | 118µs |
+| `aten::_flash_attention_backward` | 280 | 28.2ms | 101µs |
+| `aten::copy_` | 3660 | 27.9ms | 8µs |
+| `aten::_scaled_dot_product_flash_attention` | 280 | 24.2ms | 86µs |
+
+### Top Ops by CUDA Self Time
+
+| Op | Count | CUDA Total | CUDA% | Avg/call | CPU Total |
+|---|---|---|---|---|---|
+| `aten::slice` | 30 | 0.0ms | 0.0% | 0µs | 0.2ms |
+| `aten::as_strided` | 11790 | 0.0ms | 0.0% | 0µs | 6.2ms |
+| `aten::view` | 580 | 0.0ms | 0.0% | 0µs | 0.6ms |
+| `aten::to` | 20 | 0.0ms | 0.0% | 0µs | 1.6ms |
+| `aten::_to_copy` | 20 | 0.0ms | 0.0% | 0µs | 1.5ms |
+| `aten::empty_strided` | 1430 | 0.0ms | 0.0% | 0µs | 2.7ms |
+| `aten::copy_` | 3660 | 0.0ms | 0.0% | 0µs | 27.9ms |
+| `hipStreamGetCaptureInfo` | 30 | 0.0ms | 0.0% | 0µs | 0.0ms |
+| `hipMemcpyWithStream` | 30 | 0.0ms | 0.0% | 0µs | 10.5ms |
+| `Memcpy HtoD (Host -> Device)` | 12 | 0.0ms | 0.0% | 0µs | 0.0ms |
+| `Optimizer.zero_grad#MuonAdamW.zero_grad` | 10 | 0.0ms | 0.0% | 0µs | 3.6ms |
+| `forward` | 10 | 0.0ms | 0.0% | 0µs | 178.0ms |
+| `TorchDynamo Cache Lookup` | 1290 | 0.0ms | 0.0% | 0µs | 7.2ms |
+| `Torch-Compiled Region: 0/0` | 10 | 0.0ms | 0.0% | 0µs | 177.1ms |
+| `Pregraph bytecode` | 1290 | 0.0ms | 0.0% | 0µs | 2.9ms |
+| `AOTDispatcher Runtime Wrapper Prologue` | 1290 | 0.0ms | 0.0% | 0µs | 3.3ms |
+| `CompiledFunction` | 10 | 0.0ms | 0.0% | 0µs | 174.0ms |
+| `## Call CompiledFxGraph fol3rwx4wrgfnytmdj2va37jd23ploz2a7vu` | 10 | 0.0ms | 0.0% | 0µs | 170.1ms |
+| `aten::randint` | 10 | 0.0ms | 0.0% | 0µs | 0.8ms |
+| `aten::resize_` | 10 | 0.0ms | 0.0% | 0µs | 0.0ms |
+
+### Top Kernels by GPU Time (rocprof --stats)
+
+| Kernel | Calls | Total | Avg | % |
+|---|---|---|---|---|
+| `Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x96x32` | 2652 | 312.4ms | 118µs | 12.1% |
+| `Cijk_Ailk_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x32x64` | 1820 | 307.2ms | 169µs | 11.9% |
+| `Cijk_Alik_Bljk_S_B_Bias_HA_S_SAV_UserArgs_MT16x16x16_SN` | 173 | 223.0ms | 1289µs | 8.7% |
+| `Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x96x32` | 1157 | 176.9ms | 153µs | 6.9% |
+| `attn_fwd.kd` | 392 | 129.5ms | 330µs | 5.0% |
+| `triton_poi_fused__unsafe_view_add_fill_mul_sigmoid_silu` | 364 | 81.6ms | 224µs | 3.2% |
+| `Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x160x3` | 793 | 70.7ms | 89µs | 2.7% |
+| `Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT96x96x32` | 377 | 69.5ms | 184µs | 2.7% |
+| `bwd_kernel_dk_dv.kd` | 364 | 62.7ms | 172µs | 2.4% |
+| `Cijk_Ailk_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x48x32` | 364 | 59.9ms | 164µs | 2.3% |
+| `__amd_rocclr_copyBuffer.kd` | 4955 | 52.1ms | 11µs | 2.0% |
+| `triton_red_fused__log_softmax__log_softmax_backward_dat` | 13 | 51.8ms | 3988µs | 2.0% |
+| `triton_per_fused__to_copy_add_mul_native_dropout_backwa` | 273 | 51.5ms | 189µs | 2.0% |
+| `Cijk_Ailk_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x96x32` | 143 | 51.1ms | 357µs | 2.0% |
+| `triton_per_fused__to_copy__unsafe_view_add_native_dropo` | 351 | 48.5ms | 138µs | 1.9% |
 
 ---
 
@@ -299,13 +449,29 @@ Dedicated per-layer embedding tables injected into V via a learned per-head gate
 
 | Step | Change | val_loss | Δ |
 |------|--------|----------|---|
-| Baseline | SGD + cosine + learned_pos + GELU | 1.7319 | — |
+| Baseline | SGD + cosine + learned\_pos + GELU | 1.7319 | — |
 | Group 1  | → Muon+AdamW + RoPE + WSD | 1.1953 | −0.5366 |
-| Group 2  | → SwigLU + tie_weights | 1.1836 | −0.0117 |
+| Group 2  | → SwigLU + tie\_weights | 1.1836 | −0.0117 |
 | Groups 5-7 | → 28L×256d (deep-narrow arch) | 1.1708 | −0.0128 |
-| Group 8  | → token_anchor | 1.1700 | −0.0008 |
+| Group 8  | → token\_anchor | 1.1700 | −0.0008 |
 | Group 9  | → confirmed anchor-only best | 1.1696 | −0.0004 |
 | Group 10 | → vocab=10240 | 1.1660 | −0.0036 |
 | Group 11 | → 4E value embeddings, interval=8 | **1.1652** | −0.0008 |
 
 **Total improvement: −0.5667** (32.7% relative reduction from baseline)
+
+## Reflection — What We Would Do Differently
+
+### 1. Weight initialisation exploration was insufficient
+
+Muon's theoretical motivation calls for uniform initialisation with fan-in scaling — the gradient orthogonalisation step in Muon works better when the initial singular value spectrum is flat (no tails). We tested `muon_uniform` vs `gpt2` in a single group-1 experiment and found `gpt2` wins by 0.03 val_loss, but we did not investigate *why*. The most likely confound is weight tying: `lm_head` shares weights with `token_emb`, forcing embedding std to 0.02 regardless of the init scheme, which may have neutralised any benefit from uniform Muon inits. A cleaner experiment would decouple the two (at the cost of ~4M params) before drawing conclusions about Muon init theory.
+
+### 2. Custom kernels before profiling — wrong order
+
+We wrote three Triton kernels (RMSNorm, RoPE, fused CE) before running any profiler. When we eventually ran `rocprof --stats` on the best config, the results showed the dominant cost was CPU dispatch latency (43% bubble) and small GEMM tile selection caused by d\_model=256 — neither of which our kernels address. The correct workflow is: **profile first, identify hot kernels, then write targeted replacements**. Of the three kernels, none ended up in the final training path: RMSNorm is unused (final config uses LayerNorm), RoPE Triton was discovered to be faster only after correcting the benchmark shape late in the project, and fused CE provides memory savings but marginal speed improvement on gfx1151.
+
+### 3. TensorBoard integration added limited value
+
+We integrated TensorBoard (loss curves, LR schedules, weight norms) early in the project. In practice, all experiment tracking and comparison was done through JSONL log files parsed by `collect_results.py`. The TensorBoard writer added code complexity, a `SummaryWriter` dependency, and extra I/O on every training step, with minimal return — the ablation tables in this report were never derived from TensorBoard. A leaner approach would be structured JSONL logging only, with a simple `collect_results.py` for post-hoc analysis.
+
+---

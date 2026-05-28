@@ -69,6 +69,23 @@ tasks:
     cmds:
       - '{{.SSH}} "cd {{.WORK_DIR}} && {{.PYTHON}} train_hybrid.py --profile {{.CLI_ARGS}}"'
 
+  test-kernels:
+    desc: Run kernel correctness tests on remote (pytest)
+    cmds:
+      - '{{.SSH}} "cd {{.WORK_DIR}} && {{.PYTHON}} -m pytest kernels/tests/ -v {{.CLI_ARGS}}"'
+
+  bench-kernels:
+    desc: "Run kernel benchmarks on remote — isolated (no compile, no fusion); use rocprof-remote for real training impact"
+    deps: [test-kernels]
+    cmds:
+      - '{{.SSH}} "cd {{.WORK_DIR}} && {{.PYTHON}} kernels/tests/test_rms_norm.py"'
+      - '{{.SSH}} "cd {{.WORK_DIR}} && {{.PYTHON}} kernels/tests/test_rope.py"'
+
+  bench-fused-ce:
+    desc: "Benchmark fused CE v2 vs standard (slow on first run — Triton autotune cold start)"
+    cmds:
+      - '{{.SSH}} "cd {{.WORK_DIR}} && {{.PYTHON}} kernels/bench_fused_ce.py {{.CLI_ARGS}}"'
+
   rocprof-remote:
     desc: "rocprof --stats kernel timing on remote (usage: task rocprof-remote -- --profile-steps 10)"
     deps: [checkpoint]
@@ -81,6 +98,7 @@ tasks:
     cmds:
       - rsync -avz amd-container:{{.WORK_DIR}}/logs/ mainrun/logs/
       - rsync -avz --include="*.md" --exclude="*" amd-container:{{.WORK_DIR}}/profile_out/ profile_out/
+      - rsync -avz amd-container:~/tmp/rp_out.stats.csv profile_out/rocprof.stats.csv 2>/dev/null || true
 
   logs:
     desc: Tail remote training log

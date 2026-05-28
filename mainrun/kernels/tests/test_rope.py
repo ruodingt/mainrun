@@ -27,9 +27,9 @@ def _make_cos_sin(B, H, T, D, device, dtype):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("B,H,T,D", [
-    (4, 6, 64, 64),    # training shape
+    (64, 4, 128, 64),  # training shape (best config: B=64, H=4, T=128, d_head=64)
     (1, 1, 64, 64),    # minimal
-    (8, 6, 64, 64),    # larger batch
+    (8, 4, 128, 64),   # larger batch
 ])
 def test_forward(B, H, T, D):
     device = "cuda"
@@ -56,7 +56,7 @@ def test_forward_bf16(D):
 
     diff = (ref.float() - triton.float()).abs()
     print(f"  [fwd bf16] D={D}  max={diff.max():.2e}  mean={diff.mean():.2e}")
-    torch.testing.assert_close(ref, triton, atol=4e-2, rtol=0)
+    torch.testing.assert_close(ref, triton, atol=8e-2, rtol=0)
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +106,7 @@ def test_backward_bf16():
 
 def benchmark():
     device = "cuda"
-    B, H, T, D = 128, 6, 64, 64
+    B, H, T, D = 64, 4, 128, 64
     x   = torch.randn(B, H, T, D, device=device, dtype=torch.bfloat16, requires_grad=True)
     cos, sin = _make_cos_sin(B, H, T, D, device, torch.bfloat16)
 

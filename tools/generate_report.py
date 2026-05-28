@@ -5,6 +5,7 @@ Usage:
   python tools/generate_report.py
 """
 
+import csv
 from pathlib import Path
 from collect_results import collect, load_full_yaml, load_ablations_base
 
@@ -44,6 +45,48 @@ def table(headers, rows):
     lines.append("| " + " | ".join("---" for _ in headers) + " |")
     for row in rows:
         lines.append("| " + " | ".join(str(c) for c in row) + " |")
+    return "\n".join(lines)
+
+
+def profiling_section() -> str:
+    profile_md  = ROOT / "profile_out" / "report.md"
+    rocprof_csv = ROOT / "profile_out" / "rocprof.stats.csv"
+
+    if not profile_md.exists() and not rocprof_csv.exists():
+        return ""
+
+    lines = ["## Appendix — GPU Profiling", ""]
+
+    if profile_md.exists():
+        for line in profile_md.read_text().splitlines():
+            if line.startswith("## "):
+                lines.append("### " + line[3:])
+            elif line.startswith("# "):
+                lines.append("### " + line[2:])
+            else:
+                lines.append(line)
+        lines.append("")
+
+    if rocprof_csv.exists():
+        rows = []
+        with open(rocprof_csv, newline="") as f:
+            for row in csv.reader(f):
+                if len(row) < 5:
+                    continue
+                try:
+                    rows.append((row[0].strip('"'), int(row[1]), int(row[2]), int(row[3]), float(row[4])))
+                except ValueError:
+                    continue
+        rows.sort(key=lambda x: -x[2])
+        lines += [
+            "### Top Kernels by GPU Time (rocprof --stats)", "",
+            "| Kernel | Calls | Total | Avg | % |",
+            "|---|---|---|---|---|",
+        ]
+        for name, calls, total_ns, avg_ns, pct in rows[:15]:
+            lines.append(f"| `{name[:55]}` | {calls} | {total_ns/1e6:.1f}ms | {avg_ns/1e3:.0f}µs | {pct:.1f}% |")
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -521,43 +564,53 @@ Hardware: AMD Ryzen AI MAX+ 395, gfx1151 (RDNA4), 40 CU, ~300 GB/s unified memor
 
 ### RMSNorm (Triton)
 
+Benchmark shape: `(128, 64, 384)` bfloat16.
+
 | Implementation | Speed |
 |---|---|
-| `nn.RMSNorm` (baseline) | 1.0x |
-| Triton (num\\_warps=4) | 1.86x |
-| Triton + autotune | **3.99x** |
+| `nn.RMSNorm` (91.3 μs) | 1.0x |
+| Triton + autotune (49.7 μs) | **1.84x** |
 
 autotune selected: fwd `num_warps=2`, bwd `num_warps=1`.
-**Status: Enabled** — `make_norm()` returns `TritonRMSNorm` by default.
+**Status: Not used in final config** — final architecture uses `layernorm` (ablation g3_01 showed neutral vs rmsnorm).
 
 ### RoPE (Triton)
 
+Benchmark shape: `B=64, H=4, T=128, D=64` (actual training config), bfloat16 fwd+bwd.
+
 | Implementation | Speed (fwd+bwd) |
 |---|---|
-| Native PyTorch (baseline) | 1.0x |
-| Triton fwd+bwd | 0.65x |
+| Native PyTorch (283.4 μs) | 1.0x |
+| Triton (246.9 μs) | **1.15x** |
 
-Root cause: tensor too small at training scale (B=64, H=4, T=128, D=64) — kernel launch overhead dominates.
-**Status: Not enabled.** Correctness verified; reserved for MI355X / longer sequences.
+**Status: Not enabled** — discovered faster only after correcting benchmark shape late in the project. Correctness verified; enabling requires one line change in `rope.py`.
 
 ### Fused Linear + Cross-Entropy (v2)
 
 True kernel fusion: matmul written inside the Triton kernel; `[BT, V]` logit tensor never materialised.
 Two-pass algorithm: (1) online softmax + collect target logit; (2) recompute logits → grad\\_x + grad\\_W.
 
-| Implementation | Speed (fwd+bwd) | Peak Memory |
-|---|---|---|
-| Standard CE (baseline) | 1.0x (198ms) | 990 MB |
-| v2, BLOCK\\_V=32 (manual) | 0.33x | 235 MB |
-| v2, autotuned | **0.63x (313ms)** | **235 MB (4.21x savings)** |
+Full training step benchmark (B=64, T=128, V=10240, d=256, L=28):
 
-Bottleneck: 256 VGPRs required for `grad_x` accumulator crushes occupancy to 1 on RDNA4.
-RDNA4 WMMA only supports 16-bit input → bf16 cast required (no precision loss risk given fp32 exponent range).
-**Status: Optional** (`use_fused_ce=True`). Primary value is memory (4.21x), not speed on gfx1151.
-Speed advantage expected on MI355X (MFMA, HBM3, higher VGPR budget).
+| Implementation | ms/step | Peak Memory |
+|---|---|---|
+| Standard CE | 1619 ms (1.0x) | 7109 MB |
+| Fused CE v2, autotuned | **1559 ms (1.04x)** | **5815 MB (1.22x savings)** |
+
+Note: full-step times measured without `torch.compile` or operator fusion — reference only, not representative of compiled training performance. CE kernel contribution is diluted by all other ops.
+Bottleneck in isolation: 256 VGPRs for `grad_x` accumulator crushes occupancy to 1 on RDNA4.
+RDNA4 WMMA only supports 16-bit input → bf16 cast required.
+**Status: Optional** (`use_fused_ce=True`). Primary value is memory savings; speed advantage expected on MI355X.
 
 ---
 """)
+
+    # -------------------------------------------------------------------------
+    # GPU Profiling (optional — reads profile_out/ if present)
+    # -------------------------------------------------------------------------
+    prof = profiling_section()
+    if prof:
+        sections.append(prof + "\n---\n")
 
     # -------------------------------------------------------------------------
     # Summary
@@ -577,6 +630,27 @@ Speed advantage expected on MI355X (MFMA, HBM3, higher VGPR budget).
 | Group 11 | → 4E value embeddings, interval=8 | **1.1652** | −0.0008 |
 
 **Total improvement: −0.5667** (32.7% relative reduction from baseline)
+""")
+
+    # -------------------------------------------------------------------------
+    # Reflection
+    # -------------------------------------------------------------------------
+    sections.append("""\
+## Reflection — What We Would Do Differently
+
+### 1. Weight initialisation exploration was insufficient
+
+Muon's theoretical motivation calls for uniform initialisation with fan-in scaling — the gradient orthogonalisation step in Muon works better when the initial singular value spectrum is flat (no tails). We tested `muon_uniform` vs `gpt2` in a single group-1 experiment and found `gpt2` wins by 0.03 val_loss, but we did not investigate *why*. The most likely confound is weight tying: `lm_head` shares weights with `token_emb`, forcing embedding std to 0.02 regardless of the init scheme, which may have neutralised any benefit from uniform Muon inits. A cleaner experiment would decouple the two (at the cost of ~4M params) before drawing conclusions about Muon init theory.
+
+### 2. Custom kernels before profiling — wrong order
+
+We wrote three Triton kernels (RMSNorm, RoPE, fused CE) before running any profiler. When we eventually ran `rocprof --stats` on the best config, the results showed the dominant cost was CPU dispatch latency (43% bubble) and small GEMM tile selection caused by d\_model=256 — neither of which our kernels address. The correct workflow is: **profile first, identify hot kernels, then write targeted replacements**. Of the three kernels, none ended up in the final training path: RMSNorm is unused (final config uses LayerNorm), RoPE Triton was discovered to be faster only after correcting the benchmark shape late in the project, and fused CE provides memory savings but marginal speed improvement on gfx1151.
+
+### 3. TensorBoard integration added limited value
+
+We integrated TensorBoard (loss curves, LR schedules, weight norms) early in the project. In practice, all experiment tracking and comparison was done through JSONL log files parsed by `collect_results.py`. The TensorBoard writer added code complexity, a `SummaryWriter` dependency, and extra I/O on every training step, with minimal return — the ablation tables in this report were never derived from TensorBoard. A leaner approach would be structured JSONL logging only, with a simple `collect_results.py` for post-hoc analysis.
+
+---
 """)
 
     report = "\n".join(sections)

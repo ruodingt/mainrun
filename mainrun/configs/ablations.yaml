@@ -828,3 +828,37 @@ groups:
           layer_pattern: AAAEAAAAAAAEAAAAAAAEAAAAAAAE
           muon_lr: 0.025
 
+  # ----------------------------------------------------------
+  - name: group12
+    desc: "Mamba hybrid — replace first attention layer with Mamba SSM, best config base (vocab=10k, 4E, 28L×256d)"
+    group_base:
+      optimizer_type: muon_adamw
+      pos_emb: rope
+      lr_schedule: wsd
+      warmup_frac: 0.05
+      min_lr_frac: 0.05
+      decay_frac: 0.60
+      dropout: 0.1
+      mlp_act: swiglu
+      mlp_expand: 4.0
+      tie_weights: true
+      use_token_anchor: true
+      vocab_size: 10240
+      d_model: 256
+      n_q_head: 4
+      n_kv_heads: 4
+      muon_lr: 0.02
+      adamw_lr: 0.0003
+      emb_lr: 0.003
+    experiments:
+      - name: g12_00_base
+        desc: "Control: best config (4E, vocab=10k) — AAAEAAAAAAAEAAAAAAAEAAAAAAAE"
+        delta:
+          layer_pattern: AAAEAAAAAAAEAAAAAAAEAAAAAAAE
+        skip: auto
+
+      - name: g12_01_mamba_first
+        desc: "Replace first A with M — MAAEAAAAAAAEAAAAAAAEAAAAAAAE"
+        delta:
+          layer_pattern: MAAEAAAAAAAEAAAAAAAEAAAAAAAE
+

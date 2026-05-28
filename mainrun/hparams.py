@@ -104,7 +104,7 @@ class RuntimeHparams:
     """Execution config — doesn't affect loss numerics, excluded from fingerprint."""
     device: str = "cuda"            # "cuda", "cpu"
     use_fa2: bool = True            # FlashAttention-2 kernel; same math, different execution path
-    use_fused_ce: bool = False      # fused linear+CE kernel (~0.6x speed on RDNA4)
+    use_fused_ce: bool = False      # fused linear+CE kernel (save memory, ~0.6x speed on RDNA4，no need to activate)
     use_compile: bool = True
     use_bf16: bool = True
     evals_per_epoch: int = 3
