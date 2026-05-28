@@ -514,27 +514,39 @@ class Trainer:
 
         # --- Bubble analysis ---
         elapsed_us = elapsed * 1e6
-        gpu_busy_us = total_cuda
-        bubble_us = elapsed_us - gpu_busy_us
-        bubble_pct = bubble_us / elapsed_us * 100 if elapsed_us > 0 else 0
         print(f"\n{'='*72}")
         print(f"GPU bubble analysis")
         print(f"{'='*72}")
-        print(f"  Wall time   : {elapsed_us/1e3:.1f} ms")
-        print(f"  GPU busy    : {gpu_busy_us/1e3:.1f} ms  ({100-bubble_pct:.1f}%)")
-        print(f"  Bubble      : {bubble_us/1e3:.1f} ms  ({bubble_pct:.1f}%)")
 
-        # Top CPU-overhead ops: cpu_time >> cuda_time → GPU waiting for dispatch
-        print(f"\nTop CPU-overhead ops (cpu_time - cuda_time, GPU idle sources):")
+        rocm_mode = total_cuda == 0
+        if rocm_mode:
+            # ROCm: key_averages() doesn't populate cuda_time.
+            # hipDeviceSynchronize CPU time ≈ GPU execution time (CPU blocks waiting).
+            sync_ev = next((e for e in key_avgs if "hipDeviceSynchronize" in e.key), None)
+            gpu_busy_us = sync_ev.cpu_time_total if sync_ev else 0
+            print(f"  (ROCm: using hipDeviceSynchronize as GPU busy proxy)")
+        else:
+            gpu_busy_us = total_cuda
+
+        bubble_us = max(elapsed_us - gpu_busy_us, 0)
+        busy_pct = gpu_busy_us / elapsed_us * 100 if elapsed_us > 0 else 0
+        print(f"  Wall time   : {elapsed_us/1e3:.1f} ms")
+        print(f"  GPU busy    : {gpu_busy_us/1e3:.1f} ms  ({busy_pct:.1f}%)")
+        print(f"  Bubble      : {bubble_us/1e3:.1f} ms  ({100-busy_pct:.1f}%)")
+
+        # Top CPU-overhead ops: high cpu_time = dispatch latency keeping GPU idle
+        print(f"\nTop CPU-dispatch overhead (bubble sources):")
+        _skip = {"hipDeviceSynchronize", "record_function"}
         overhead = []
         for e in key_avgs:
-            cuda_us = _cuda_us(e)
-            cpu_overhead = e.cpu_time_total - cuda_us
+            if any(s in e.key for s in _skip):
+                continue
+            cpu_overhead = e.cpu_time_total
             if cpu_overhead > 0 and e.count > 0:
                 overhead.append((cpu_overhead, e))
         overhead.sort(reverse=True)
         oh_fmt = "  {:<48}  {:>8}  {:>10}  {:>10}"
-        print(oh_fmt.format("Op", "Count", "CPU ovhd", "per call"))
+        print(oh_fmt.format("Op", "Count", "CPU time", "per call"))
         print(oh_fmt.format("-"*48, "-"*8, "-"*10, "-"*10))
         for cpu_oh, e in overhead[:10]:
             print(oh_fmt.format(
@@ -545,6 +557,70 @@ class Trainer:
 
         print(f"\nTrace → {output}/")
         print(f"  TensorBoard: tensorboard --logdir {output}")
+
+        # --- Markdown report ---
+        import datetime
+        cfg = self.args
+        md_lines = [
+            f"# Profile Report",
+            f"",
+            f"**Date:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}  ",
+            f"**Config:** `{cfg.arch.layer_pattern}`  ",
+            f"**Model:** {self.model_params/1e6:.1f}M params, {cfg.arch.n_layer}L × {cfg.arch.d_model}d, vocab={cfg.arch.vocab_size}  ",
+            f"**Steps:** {warmup} warmup + {steps} profiled  ",
+            f"**Throughput:** {tok_s:,.0f} tok/s  ",
+            f"",
+            f"## Memory",
+            f"",
+        ]
+        if device == "cuda":
+            md_lines += [
+                f"| | GB |",
+                f"|---|---|",
+                f"| Allocated (peak) | {alloc:.2f} |",
+                f"| Reserved (peak)  | {rsvd:.2f} |",
+            ]
+        md_lines += [
+            f"",
+            f"## GPU Bubble Analysis",
+            f"",
+            f"{'> ROCm mode: hipDeviceSynchronize used as GPU busy proxy' if rocm_mode else ''}",
+            f"",
+            f"| | ms | % |",
+            f"|---|---|---|",
+            f"| Wall time | {elapsed_us/1e3:.1f} | 100% |",
+            f"| GPU busy  | {gpu_busy_us/1e3:.1f} | {busy_pct:.1f}% |",
+            f"| Bubble    | {bubble_us/1e3:.1f} | {100-busy_pct:.1f}% |",
+            f"",
+            f"## Top CPU-Dispatch Overhead (Bubble Sources)",
+            f"",
+            f"| Op | Count | CPU time | per call |",
+            f"|---|---|---|---|",
+        ]
+        for cpu_oh, e in overhead[:topk]:
+            md_lines.append(
+                f"| `{e.key[:60]}` | {e.count} | {cpu_oh/1e3:.1f}ms | {cpu_oh/e.count:.0f}µs |"
+            )
+        md_lines += [
+            f"",
+            f"## Top Ops by CUDA Self Time",
+            f"",
+            f"| Op | Count | CUDA Total | CUDA% | Avg/call | CPU Total |",
+            f"|---|---|---|---|---|---|",
+        ]
+        for e in sorted_avgs[:topk]:
+            cuda_us = _cuda_us(e)
+            pct = cuda_us / total_cuda * 100 if total_cuda > 0 else 0
+            avg_us = cuda_us / e.count if e.count > 0 else 0
+            md_lines.append(
+                f"| `{e.key[:60]}` | {e.count} | {cuda_us/1e3:.1f}ms | {pct:.1f}% "
+                f"| {avg_us:.0f}µs | {e.cpu_time_total/1e3:.1f}ms |"
+            )
+
+        md_path = _os.path.join(output, "report.md")
+        with open(md_path, "w") as f:
+            f.write("\n".join(md_lines) + "\n")
+        print(f"  Markdown:    {md_path}")
 
     # ------------------------------------------------------------------
 
