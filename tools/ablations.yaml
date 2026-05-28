@@ -807,9 +807,10 @@ groups:
         desc: "vocab=10k. Control: 28A, vocab=10240, no VE"
         delta:
           vocab_size: 10240
+          layer_pattern: AAAAAAAAAAAAAAAAAAAAAAAAAAAA
 
       - name: g11_9_vocab10k_5ve_i7
-        desc: "vocab=10k. Control: 28A, vocab=10240, 4VE layers at pos 27, 22, 17, 12, 7, AAAEAAAAAAAEAAAAAAAEAAAAAAAE"
+        desc: "vocab=10k. Control: 28A, vocab=10240, 4VE layers at pos 27, 22, 17, 12, 7, AAAAAAAEAAAAEAAAAEAAAAEAAAAE"
         delta:
           vocab_size: 10240
           layer_pattern: AAAAAAAEAAAAEAAAAEAAAAEAAAAE
