@@ -35,7 +35,7 @@ def _top_overhead(key_avgs, skip=("hipDeviceSynchronize", "record_function")):
 class ProfilerMixin:
 
     # TODO：Tactical solution kto keep trainer small
-    #  highly relying on Trainer right now, more decoupling needed later
+    #  highly relying on Trainer right now, more decoupling needed later - using mock data
     def profile(self, warmup: int = 3, steps: int = 10,
                 output: str = "profile_out", topk: int = 20):
         from torch.profiler import profile as tprofile, record_function, ProfilerActivity
@@ -154,16 +154,17 @@ class ProfilerMixin:
         col_w  = [48, 7, 12, 7, 10, 12]
         fmt    = "  ".join(f"{{:<{w}}}" for w in col_w)
         header = ["Op", "Count", "CUDA Total", "CUDA%", "Avg/call", "CPU Total"]
-        print(f"\n{'='*72}\nTop-{topk} ops by CUDA self time\n{'='*72}")
-        print(fmt.format(*header))
-        print("  ".join("-" * w for w in col_w))
-        for e in sorted_avgs[:topk]:
-            cuda_us = _cuda_us(e)
-            pct     = cuda_us / total_cuda * 100 if total_cuda > 0 else 0
-            avg_us  = cuda_us / e.count if e.count > 0 else 0
-            print(fmt.format(e.key[:48], str(e.count),
-                             f"{cuda_us/1e3:.1f}ms", f"{pct:.1f}%",
-                             f"{avg_us:.0f}us", f"{e.cpu_time_total/1e3:.1f}ms"))
+        if not rocm_mode:
+            print(f"\n{'='*72}\nTop-{topk} ops by CUDA self time\n{'='*72}")
+            print(fmt.format(*header))
+            print("  ".join("-" * w for w in col_w))
+            for e in sorted_avgs[:topk]:
+                cuda_us = _cuda_us(e)
+                pct     = cuda_us / total_cuda * 100 if total_cuda > 0 else 0
+                avg_us  = cuda_us / e.count if e.count > 0 else 0
+                print(fmt.format(e.key[:48], str(e.count),
+                                 f"{cuda_us/1e3:.1f}ms", f"{pct:.1f}%",
+                                 f"{avg_us:.0f}us", f"{e.cpu_time_total/1e3:.1f}ms"))
 
         if alloc:
             print(f"\nPeak memory: {alloc:.2f} GB allocated  /  {rsvd:.2f} GB reserved")
@@ -222,12 +223,6 @@ class ProfilerMixin:
                       f"| Reserved (peak)  | {rsvd:.2f} |"]
 
         lines += [
-            "", "## GPU Bubble Analysis", "",
-            *(["> ROCm: hipDeviceSynchronize used as GPU busy proxy", ""] if rocm_mode else []),
-            "| | ms | % |", "|---|---|---|",
-            f"| Wall time | {elapsed_us/1e3:.1f} | 100% |",
-            f"| GPU busy  | {gpu_busy_us/1e3:.1f} | {busy_pct:.1f}% |",
-            f"| Bubble    | {bubble_us/1e3:.1f} | {100-busy_pct:.1f}% |",
             "", "## Top CPU-Dispatch Overhead", "",
             "| Op | Count | CPU time | per call |", "|---|---|---|---|",
         ]
@@ -235,17 +230,18 @@ class ProfilerMixin:
             lines.append(f"| `{e.key[:60]}` | {e.count} "
                          f"| {cpu_oh/1e3:.1f}ms | {cpu_oh/e.count:.0f}µs |")
 
-        lines += [
-            "", "## Top Ops by CUDA Self Time", "",
-            "| Op | Count | CUDA Total | CUDA% | Avg/call | CPU Total |",
-            "|---|---|---|---|---|---|",
-        ]
-        for e in sorted_avgs[:topk]:
-            cuda_us = _cuda_us(e)
-            pct    = cuda_us / total_cuda * 100 if total_cuda > 0 else 0
-            avg_us = cuda_us / e.count if e.count > 0 else 0
-            lines.append(f"| `{e.key[:60]}` | {e.count} | {cuda_us/1e3:.1f}ms "
-                         f"| {pct:.1f}% | {avg_us:.0f}µs | {e.cpu_time_total/1e3:.1f}ms |")
+        if not rocm_mode:
+            lines += [
+                "", "## Top Ops by CUDA Self Time", "",
+                "| Op | Count | CUDA Total | CUDA% | Avg/call | CPU Total |",
+                "|---|---|---|---|---|---|",
+            ]
+            for e in sorted_avgs[:topk]:
+                cuda_us = _cuda_us(e)
+                pct    = cuda_us / total_cuda * 100 if total_cuda > 0 else 0
+                avg_us = cuda_us / e.count if e.count > 0 else 0
+                lines.append(f"| `{e.key[:60]}` | {e.count} | {cuda_us/1e3:.1f}ms "
+                             f"| {pct:.1f}% | {avg_us:.0f}µs | {e.cpu_time_total/1e3:.1f}ms |")
 
         md_path = os.path.join(output, "report.md")
         with open(md_path, "w") as f:

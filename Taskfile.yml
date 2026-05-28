@@ -87,10 +87,10 @@ tasks:
       - '{{.SSH}} "cd {{.WORK_DIR}} && {{.PYTHON}} kernels/bench_fused_ce.py {{.CLI_ARGS}}"'
 
   rocprof-remote:
-    desc: "rocprof --stats kernel timing on remote (usage: task rocprof-remote -- --profile-steps 10)"
+    desc: "rocprof --stats + --sys-trace kernel timing on remote (usage: task rocprof-remote -- --profile-steps 10)"
     deps: [checkpoint]
     cmds:
-      - '{{.SSH}} "mkdir -p ~/tmp && cd {{.WORK_DIR}} && rocprof --stats -o ~/tmp/rp_out.csv {{.PYTHON}} train_hybrid.py --profile {{.CLI_ARGS}}"'
+      - '{{.SSH}} "mkdir -p ~/tmp && cd {{.WORK_DIR}} && rocprof --stats --sys-trace -o ~/tmp/rp_out.csv {{.PYTHON}} train_hybrid.py --profile {{.CLI_ARGS}}"'
       - '{{.SSH}} "sort -t, -k4 -rn ~/tmp/rp_out.stats.csv | head -30"'
 
   sync:

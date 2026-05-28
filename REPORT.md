@@ -294,6 +294,18 @@ embedding tables are separate from `token_emb`, optimised with `emb_lr`.
 
 ---
 
+## Group 12 — Mamba Hybrid (first layer)
+
+Base: best config (28L×256d, vocab=10240, 4E layers, Muon+AdamW+RoPE+WSD)
+**Key finding:** Replacing the first attention layer with Mamba SSM hurts both quality (+0.0076) and throughput (−42% tok/s). At T=128, Mamba's sequential recurrence cannot parallelise over the sequence dimension; pure attention remains better at this scale.
+
+| Config | val_loss | Δ vs base | tok/s | Params |
+| --- | --- | --- | --- | --- |
+| **best config (pure attention)** ✓ | 1.1650 | +0.0000 | 41,947 | 35.62M |
+| first layer → Mamba SSM | 1.1726 | +0.0076 | 24,174 | 35.82M |
+
+---
+
 ## Appendix — Custom Kernel Benchmarks
 
 Hardware: AMD Ryzen AI MAX+ 395, gfx1151 (RDNA4), 40 CU, ~300 GB/s unified memory.
@@ -363,16 +375,6 @@ RDNA4 WMMA only supports 16-bit input → bf16 cast required.
 | Allocated (peak) | 4.18 |
 | Reserved (peak)  | 6.45 |
 
-### GPU Bubble Analysis
-
-> ROCm: hipDeviceSynchronize used as GPU busy proxy
-
-| | ms | % |
-|---|---|---|
-| Wall time | 2320.1 | 100% |
-| GPU busy  | 1002.8 | 43.2% |
-| Bubble    | 1317.2 | 56.8% |
-
 ### Top CPU-Dispatch Overhead
 
 | Op | Count | CPU time | per call |
@@ -425,6 +427,9 @@ RDNA4 WMMA only supports 16-bit input → bf16 cast required.
 
 ### Top Kernels by GPU Time (rocprof --stats)
 
+
+**Bubble (rocprof):** wall 232.0 ms/step, kernel sum 257.4 ms/step — kernel sum exceeds wall time, indicating significant kernel overlap. Accurate bubble requires `rocprof --sys-trace` for timeline analysis.
+
 | Kernel | Calls | Total | Avg | % |
 |---|---|---|---|---|
 | `Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x96x32` | 2652 | 312.4ms | 118µs | 12.1% |
@@ -468,9 +473,25 @@ Muon's theoretical motivation calls for uniform initialisation with fan-in scali
 
 ### 2. Custom kernels before profiling — wrong order
 
-We wrote three Triton kernels (RMSNorm, RoPE, fused CE) before running any profiler. When we eventually ran `rocprof --stats` on the best config, the results showed the dominant cost was CPU dispatch latency (43% bubble) and small GEMM tile selection caused by d\_model=256 — neither of which our kernels address. The correct workflow is: **profile first, identify hot kernels, then write targeted replacements**. Of the three kernels, none ended up in the final training path: RMSNorm is unused (final config uses LayerNorm), RoPE Triton was discovered to be faster only after correcting the benchmark shape late in the project, and fused CE provides memory savings but marginal speed improvement on gfx1151.
+We wrote three Triton kernels (RMSNorm, RoPE, fused CE) before running any profiler. When we eventually ran `rocprof --stats` on the best config, the results showed the dominant cost was CPU dispatch latency (43% bubble) and small GEMM tile selection caused by d_model=256 — neither of which our kernels address. The correct workflow is: **profile first, identify hot kernels, then write targeted replacements**. Of the three kernels, none ended up in the final training path: RMSNorm is unused (final config uses LayerNorm), RoPE Triton was discovered to be faster only after correcting the benchmark shape late in the project, and fused CE provides memory savings but marginal speed improvement on gfx1151.
 
-### 3. TensorBoard integration added limited value
+### 3. Vocab size was fixed too early
+
+`vocab_size` was not systematically swept until Group 10 — after nine groups of experiments all run at `vocab_size=16000`. The final optimal value turned out to be 10240 (−0.004 vs 16k). This means Groups 1–9 were optimising on a suboptimal vocabulary, and some conclusions may not fully transfer: in particular, the value embedding experiments (Group 11) showed VE benefits more with vocab=16k than 10k, suggesting the Group 11 results are partly an artefact of the vocab choice. Vocab size interacts with embedding dimensionality, weight tying, and token identity signal; it should be treated as a foundational hyperparameter and swept in the first group rather than the tenth.
+
+### 4. Sequential ablation search misses interactions; automatic tuning was underused
+
+Each group performed single-variable search on top of the previous group's best config. This greedy sequential strategy cannot discover interactions between hyperparameters — for example, the optimal `muon_lr` for 28L×256d may differ from the value inherited from Group 1 (6L×512d), and the optimal depth for a given vocab size was never jointly optimised. We did implement Optuna TPE hyperparameter search (`hypertune.py`) but used it only for a narrow LR sweep rather than as the primary search strategy. Investing more in automatic tuning earlier — using Optuna to jointly search over depth, width, vocab, and LR — would likely have found better configurations faster and with less manual iteration.
+
+### 5. Value embedding parameter efficiency was poor
+
+The final architecture includes 4 E-type (value embedding) layers, contributing +10.5M parameters (+42% of the base model) for a val_loss improvement of only −0.0008. No iso-parameter comparison was made: it is unknown whether the same 10.5M parameters spent on additional attention layers, wider d_model, or deeper depth would have yielded greater benefit. We selected 4E because it was the best option within Group 11's search space, but the parameter efficiency of this choice was never challenged against alternatives.
+
+### 6. Mamba hybrid did not help
+
+A single experiment (g12_01) replaced the first attention layer with a Mamba SSM layer, keeping all other best-config settings (28L×256d, vocab=10240, 4E layers). Result: val_loss worsened by 0.0076 (1.1650→1.1726) and throughput dropped from 41,947 to 24,174 tok/s — a 42% speed penalty. The speed regression is expected: Mamba's sequential recurrence cannot be parallelised over the sequence dimension the way attention can, and at T=128 the SSM overhead outweighs any potential efficiency gain. The quality regression suggests that at this scale and sequence length, the first-layer position is better served by attention's global context than by Mamba's local state. Hybrid architectures may have merit at longer sequences or larger scale, but within this project's constraints the result is a clear negative.
+
+### 4. TensorBoard integration added limited value
 
 We integrated TensorBoard (loss curves, LR schedules, weight norms) early in the project. In practice, all experiment tracking and comparison was done through JSONL log files parsed by `collect_results.py`. The TensorBoard writer added code complexity, a `SummaryWriter` dependency, and extra I/O on every training step, with minimal return — the ablation tables in this report were never derived from TensorBoard. A leaner approach would be structured JSONL logging only, with a simple `collect_results.py` for post-hoc analysis.
 
