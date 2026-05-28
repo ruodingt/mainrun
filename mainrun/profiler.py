@@ -11,6 +11,7 @@ import os
 import time
 
 import torch
+from data_utils import get_batch
 
 
 
@@ -118,7 +119,6 @@ class ProfilerMixin:
 
     def _analyze_graph_breaks(self, block_size, batch_size, device):
         print("\nGraph break analysis...")
-        from train_hybrid import get_batch
         xb, yb, _ = get_batch(self.train_ids, 0, block_size, batch_size, device)
         explanation = torch._dynamo.explain(self.model)(xb, yb)
         n_graphs = len(explanation.graphs)
