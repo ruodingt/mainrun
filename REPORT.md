@@ -486,79 +486,44 @@ Full training step benchmark (B=64, T=128, V=10240, d=256, L=28):
 | Fused CE v2, autotuned | **1559 ms (1.04x)** | **5815 MB (1.22x savings)** |
 
 Note: full-step times measured without `torch.compile` or operator fusion — reference only, not representative of compiled training performance. CE kernel contribution is diluted by all other ops.
-**Status: Optional** (`use_fused_ce=True`). Primary value is memory savings (1.22x). Speed on MI355X not measured.
+**Status: Optional** (`use_fused_ce=True`). Primary value is memory savings (1.22x). Test needed to understand the gaining on other AMD GPUs (e.g. MI355X).
 
 ---
 
 ## Appendix — GPU Profiling
 
-### Profile Report
+Profiled on AMD MI355X using `torch.profiler` (CPU + GPU activities). 10 steps after 3 warmup steps, with `torch.compile` active.
 
-**Date:** 2026-05-28 15:03  
-**Config:** `AAAEAAAAAAAEAAAAAAAEAAAAAAAE`  
-**Model:** 35.6M params, 28L × 256d, vocab=10240  
-**Throughput:** 35,029 tok/s (approximate — includes trace file write)
+**Config:** `AAAEAAAAAAAEAAAAAAAEAAAAAAAE` · 35.6M params · 28L × 256d · vocab=10240  
+**Date:** 2026-05-28
 
-### Graph Breaks
+### Headline Results
 
-| | |
+| Metric | Value |
 |---|---|
-| Graphs | 1 |
-| Breaks | 0 |
+| Throughput | 35,029 tok/s |
+| GPU Utilisation (Chrome Trace) | **93.8%** |
+| torch.compile graphs | 1 |
+| Graph breaks | **0** |
+| Peak memory allocated | 4.18 GB / 6.45 GB reserved |
 
-### Memory
+**0 graph breaks** means `torch.compile` captured the entire forward + backward as a single compiled graph with no fallback to eager Python. This is the prerequisite for any of the other efficiency numbers to be meaningful.
 
-| | GB |
-|---|---|
-| Allocated (peak) | 4.18 |
-| Reserved (peak)  | 6.45 |
+**93.8% GPU utilisation** is measured from the Chrome Trace timeline (kernel wall time vs total wall time). The remaining 6.2% idle breaks down into:
 
-### Top CPU-Dispatch Overhead
+| Source | Size | Cause |
+|---|---|---|
+| Kernel launch overhead | ~68 ms | ~1,224 HIP kernel dispatches/step × ~5µs/launch |
+| Optimizer bubbles | ~36 ms | 49 gaps >200µs, all following Muon-related kernels; root cause unconfirmed (requires CPU-stack trace) |
 
-| Op | Count | CPU time | per call |
-|---|---|---|---|
-| `backward` | 10 | 245.7ms | 24569µs |
-| `autograd::engine::evaluate_function: CompiledFunctionBackwar` | 10 | 222.3ms | 22231µs |
-| `CompiledFunctionBackward` | 10 | 220.9ms | 22088µs |
-| `## Call CompiledFxGraph fbvcwuqulrovfujd7iuc223hzjvp3lnu3ph7` | 10 | 216.7ms | 21675µs |
-| `optimizer_step` | 10 | 179.2ms | 17924µs |
-| `Optimizer.step#MuonAdamW.step` | 10 | 178.9ms | 17892µs |
-| `forward` | 10 | 151.8ms | 15182µs |
-| `Torch-Compiled Region: 0/0` | 10 | 150.8ms | 15076µs |
-| `CompiledFunction` | 10 | 146.6ms | 14664µs |
-| `## Call CompiledFxGraph fol3rwx4wrgfnytmdj2va37jd23ploz2a7vu` | 10 | 142.5ms | 14254µs |
-| `aten::mm` | 5190 | 118.7ms | 23µs |
-| `hipModuleLaunchKernel` | 12240 | 86.7ms | 7µs |
-| `Torch-Compiled Region: 2/2` | 1140 | 73.4ms | 64µs |
-| `## Call CompiledFxGraph fbmxl54y4yvqkz2ubnufvdfv4ujzt3fo5sf7` | 1140 | 56.7ms | 50µs |
-| `hipExtModuleLaunchKernel` | 5830 | 44.9ms | 8µs |
-| `triton_poi_fused_add_copy__div_lerp_mul_neg_pow_rsub_sqrt_0` | 1240 | 30.6ms | 25µs |
-| `aten::_scaled_dot_product_flash_attention_backward` | 280 | 24.6ms | 88µs |
-| `aten::copy_` | 3660 | 23.8ms | 6µs |
-| `aten::_scaled_dot_product_flash_attention` | 280 | 20.5ms | 73µs |
-| `aten::_flash_attention_backward` | 280 | 20.4ms | 73µs |
 
-### Top Kernels by GPU Time (rocprof --stats)
+Source trace file can be found in [profile_out](profile_out/7f50c7a00fc0_539736.1780024768687460356.pt.trace.json). 
+Some initial analysis can be found in [](docs/analysis/profiling.md)
 
-| Kernel | Calls | Total | Avg | % |
-|---|---|---|---|---|
-| `Cijk_Alik_Bljk_S_B_Bias_HA_S_SAV_UserArgs_MT16x16x8_SN_` | 173 | 179.7ms | 1039µs | 26.1% |
-| `Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x96x32` | 408 | 48.6ms | 119µs | 7.1% |
-| `Cijk_Ailk_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x32x64` | 280 | 47.7ms | 170µs | 6.9% |
-| `attn_fwd` | 84 | 41.4ms | 493µs | 6.0% |
-| `triton_red_fused__to_copy_add_mul_native_dropout_backwa` | 214 | 30.6ms | 143µs | 4.5% |
-| `Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x96x32` | 178 | 27.3ms | 154µs | 4.0% |
-| `triton_red_fused__to_copy_add_mul_native_dropout_native` | 41 | 27.1ms | 660µs | 3.9% |
-| `triton_red_fused__to_copy_add_mul_native_dropout_native` | 41 | 25.8ms | 628µs | 3.7% |
-| `triton_red_fused__to_copy_add_mul_native_dropout_native` | 41 | 25.6ms | 624µs | 3.7% |
-| `triton_poi_fused__unsafe_view_add_fill_mul_sigmoid_silu` | 56 | 12.9ms | 230µs | 1.9% |
-| `Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x160x3` | 122 | 11.5ms | 94µs | 1.7% |
-| `Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT96x96x32` | 58 | 10.9ms | 188µs | 1.6% |
-| `bwd_kernel_dk_dv` | 56 | 9.8ms | 175µs | 1.4% |
-| `Cijk_Ailk_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x48x32` | 56 | 9.3ms | 166µs | 1.4% |
-| `void at::native::elementwise_kernel_manual_unroll<128, ` | 256 | 8.9ms | 35µs | 1.3% |
+The launch overhead is an inherent cost of the HIP/ROCm driver and cannot be reduced without CUDA Graphs. 
+The optimizer bubbles are a candidate for future optimisation (replacing per-param Python loops with fused `_foreach` ops).
 
----
+
 
 ## Summary — Best Config Evolution
 

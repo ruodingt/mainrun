@@ -38,12 +38,16 @@ def short_name(name: str) -> str:
     return name[:50]
 
 
-def classify_gap_source(prev_name: str) -> str:
+def classify_gap_by_prev(prev_name: str) -> str:
+    """Group gaps by the kernel that precedes them.
+    This is a label for exploration, NOT a causal attribution.
+    The actual cause of each gap requires CPU-side stack traces to determine.
+    """
     if "multi_tens" in prev_name:
-        return "Muon multi_tensor_op"
+        return "after: multi_tensor_op"
     if "triton_poi_fused_add_copy__div_lerp" in prev_name:
-        return "Muon nesterov step"
-    return prev_name[:50]
+        return "after: triton_poi_fused_add_copy__div_lerp (AdamW/Muon update)"
+    return f"after: {prev_name[:50]}"
 
 
 def analyse(path: str, top: int = 20) -> None:
@@ -102,8 +106,8 @@ def analyse(path: str, top: int = 20) -> None:
     if large_gaps:
         by_src = collections.defaultdict(list)
         for g in large_gaps:
-            by_src[classify_gap_source(g["prev"])].append(g["gap"])
-        print("\n  Real bubbles by source:")
+            by_src[classify_gap_by_prev(g["prev"])].append(g["gap"])
+        print("\n  Bubbles grouped by preceding kernel (label only, not causal):")
         for src, gs in sorted(by_src.items(), key=lambda x: -sum(x[1])):
             print(f"    {sum(gs)/1e3:6.1f} ms | {len(gs):3}x avg {sum(gs)/len(gs):.0f} µs | {src}")
 
