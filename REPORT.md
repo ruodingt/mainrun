@@ -3,7 +3,7 @@
 **Goal:** Minimise validation loss on Hacker News titles (100k, 7 epochs, seed=1337).
 **Final best:** 28L×256d×10240 + Muon+AdamW + WSD + RoPE + SwigLU + tie_weights + token_anchor → **val_loss = 1.1650 - 1.1660**
 
-The best result (with val_loss: 1.165-1.166) come from an experiment in [group 12 baseline](#group-12--mamba-hybrid-first-layer).
+The best result (with val_loss: 1.165-1.166) comes from an experiment in [group 12 baseline](#group-12--mamba-hybrid-first-layer).
 
 Key drivers behind performance (in terms of val loss) comes from:
 - Muon optimiser
@@ -117,7 +117,7 @@ gpt2 init beats muon_uniform init.
 | g1_12 | optimizer_type=muon_adamw, pos_emb=rope, lr_schedule=wsd, warmup_frac=0.05, min_lr_frac=0.05, weight_init=muon_uniform | 1.2261 | -0.5058 | 35.29M | 57,142 |
 
 
-Note: baseline 1.7319 rather than 1.754 is most likely come from 2 reasons:
+Note: baseline 1.7319 rather than 1.754 is most likely due to 2 reasons:
 
 1. no dropout in position embedding in the implementation
 2. Head embedding is untied from the input token embedding
@@ -549,7 +549,7 @@ Full training step benchmark (B=64, T=128, V=10240, d=256, L=28):
 | Fused CE v2, autotuned | **1559 ms (1.04x)** | **5815 MB (1.22x savings)** |
 
 Note: full-step times measured without `torch.compile` or operator fusion — reference only, not representative of compiled training performance. CE kernel contribution is diluted by all other ops.
-**Status: Optional** (`use_fused_ce=True`). Primary value is memory savings (1.22x). Test needed to understand the gaining on other AMD GPUs (e.g. MI355X).
+**Status: Optional** (`use_fused_ce=True`). Primary value is memory savings (1.22x). Further testing needed to understand performance gains on other AMD GPUs (e.g. MI355X).
 
 ---
 
@@ -566,7 +566,7 @@ Note: full-step times measured without `torch.compile` or operator fusion — re
 | Group 9    | → confirmed anchor-only best           | 1.1696     | --                                 |
 | Group 10   | → vocab=10240                          | 1.1660     | −0.0040                            |
 | Group 11   | → 4E value embeddings (pos 3,11,19,27) | **1.1650** | -0.0010 (no significant advantage) |
-| Group 11   | No change - Mamba works worse          |            | --                                 |
+| Group 12   | No change - Mamba works worse          |            | --                                 |
 
 **Total improvement: −0.5669** (32.7% relative reduction from baseline)
 
