@@ -600,6 +600,6 @@ We integrated TensorBoard (loss curves, LR schedules, weight norms) early in the
 
 ### 6. results can be more statistically robustness 
 
-Could take multiple run for a experiment to get a more statistically robust result. 
+Could take multiple runs for each experiment to get more statistically robust results. 
 
 ---
