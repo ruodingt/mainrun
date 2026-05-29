@@ -461,6 +461,8 @@ muon_lr: 0.02
 | **g12_00** | **28L+4E@3,11,19,27 ✓** | **1.1650** | **-0.5669** | **35.62M** | **41,947** |
 | g12_01 | 28L+1M@0+4E@3,11,19,27 | 1.1726 | +0.0076 | 35.82M | 24,174 |
 
+Observation: With Mamba replacing the first layer, the loss drops faster at early epoches, but it converges at higher val loss in late epoches.
+
 ---
 
 ## Appendix — GPU Profiling
