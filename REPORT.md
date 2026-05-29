@@ -446,6 +446,50 @@ muon_lr: 0.02
 
 ---
 
+## Appendix — GPU Profiling
+
+Profiled on AMD MI355X using `torch.profiler` (CPU + GPU activities). 10 steps after 3 warmup steps, with `torch.compile` active.
+
+**Config:** `AAAEAAAAAAAEAAAAAAAEAAAAAAAE` · 35.6M params · 28L × 256d · vocab=10240  
+**Date:** 2026-05-28
+
+### Headline Results
+
+```aiignore
+
+============================================================
+GPU UTILISATION
+============================================================
+  Time span:     1687.4 ms
+  Compute:       1582.5 ms  (93.8%)
+  Void:           104.9 ms  (6.2%)
+
+============================================================
+VOID DISTRIBUTION
+============================================================
+  [    0 – 2     µs]:  5247 voids      9.9 ms
+  [    2 – 5     µs]:  7939 voids     16.9 ms
+  [    5 – 10    µs]:  5877 voids     38.8 ms
+  [   10 – 20    µs]:   139 voids      1.6 ms
+  [   20 – 50    µs]:     3 voids      0.1 ms
+  [   50 – 100   µs]:     2 voids      0.1 ms
+  [  100 – 500   µs]:     3 voids      0.4 ms
+  [  500 – 1000  µs]:    35 voids     19.6 ms
+  [ 1000 – 5000  µs]:    14 voids     17.5 ms
+  [ 5000 – ∞     µs]:     0 voids      0.0 ms
+
+  Launch overhead (≤200µs): 67.8 ms  (19210 voids)
+  Bubbles        (>200µs): 37.1 ms  (49 voids)
+  
+```
+
+Source trace file can be found in [profile_out](mainrun/profile_out). 
+
+Some initial analysis can be found in [profiling.md](docs/analysis/profiling.md). 
+
+Given we have got pretty high GPU Util, limited gain can be obtained to further explore this direction.
+
+
 ## Appendix — Custom Kernel Benchmarks
 
 Hardware: AMD Ryzen AI MAX+ 395, gfx1151 (RDNA4), 40 CU, ~300 GB/s unified memory.
@@ -490,32 +534,11 @@ Note: full-step times measured without `torch.compile` or operator fusion — re
 
 ---
 
-## Appendix — GPU Profiling
 
-Profiled on AMD MI355X using `torch.profiler` (CPU + GPU activities). 10 steps after 3 warmup steps, with `torch.compile` active.
+## Appendix - Run Experiment
 
-**Config:** `AAAEAAAAAAAEAAAAAAAEAAAAAAAE` · 35.6M params · 28L × 256d · vocab=10240  
-**Date:** 2026-05-28
 
-### Headline Results
-
-| Metric | Value |
-|---|---|
-| Throughput | 35,029 tok/s |
-| torch.compile graphs | 1 |
-| Graph breaks | **0** |
-| Peak memory allocated | 4.18 GB / 6.45 GB reserved |
-
-**0 graph breaks** means `torch.compile` captured the entire forward + backward as a single compiled graph with no fallback to eager Python. This is the prerequisite for any of the other efficiency numbers to be meaningful.
-
-GPU idle time was partially characterised via Chrome Trace analysis. Two sources were identified but not fully attributed:
-
-Source trace file can be found in [profile_out](profile_out/). 
-Some initial analysis can be found in [](docs/analysis/profiling.md)
-
-The launch overhead is an inherent cost of the HIP/ROCm driver and cannot be reduced without CUDA Graphs. 
-The optimizer bubbles are a candidate for future optimisation (replacing per-param Python loops with fused `_foreach` ops).
-
+task train
 
 
 ## Summary — Best Config Evolution
