@@ -66,7 +66,7 @@ class ProfilerMixin:
         with tprofile(
             activities=activities,
             record_shapes=False,
-            with_stack=True,
+            with_stack=False,  # ROCm does not populate stackFrames; True adds profiler overhead without benefit
             profile_memory=False,
             on_trace_ready=torch.profiler.tensorboard_trace_handler(output),
         ) as prof:

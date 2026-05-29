@@ -540,7 +540,7 @@ The optimizer bubbles are a candidate for future optimisation (replacing per-par
 
 **Total improvement: −0.5667** (32.7% relative reduction from baseline)
 
-## Reflection — What We Would Do Differently
+## Reflections
 
 ### 1. Weight initialisation exploration was insufficient
 
