@@ -1,16 +1,16 @@
 # Ablation Study Report
 
 **Goal:** Minimise validation loss on Hacker News titles (100k, 7 epochs, seed=1337).
-**Final best:** 28L×256d×10240 + Muon+AdamW + WSD + RoPE + SwigLU + tie_weights + token_anchor → **val_loss = 1.1650 - 1.660**
+**Final best:** 28L×256d×10240 + Muon+AdamW + WSD + RoPE + SwigLU + tie_weights + token_anchor → **val_loss = 1.1650 - 1.1660**
 
 The best result (with val_loss: 1.165-1.166) come from an experiment in [group 12 baseline](#group-12--mamba-hybrid-first-layer).
 
 Key drivers behind performance (in terms of val loss) comes from:
-- Moun optimiser
+- Muon optimiser
 - Vocab size
 - deeper but narrower models
 
-We have 12 groups of abaltion study which tells the entire journey of pushing down val_loss. 
+We have 12 groups of ablation study which tells the entire journey of pushing down val_loss. 
 
 In terms of training throughput, we used bf16 AMP and torch compile to speed up the training on AMD GPU.
 
@@ -465,7 +465,7 @@ muon_lr: 0.02
 
 ## Appendix — GPU Profiling
 
-Profiled on AMD MI355X using `torch.profiler` (CPU + GPU activities). 10 steps after 3 warmup steps, with `torch.compile` active.
+Profiled on AMD 8060S using `torch.profiler` (CPU + GPU activities). 10 steps after 3 warmup steps, with `torch.compile` active.
 
 **Config:** `AAAEAAAAAAAEAAAAAAAEAAAAAAAE` · 35.6M params · 28L × 256d · vocab=10240  
 **Date:** 2026-05-28
@@ -568,7 +568,7 @@ Note: full-step times measured without `torch.compile` or operator fusion — re
 | Group 11   | → 4E value embeddings (pos 3,11,19,27) | **1.1650** | -0.0010 (no significant advantage) |
 | Group 11   | No change - Mamba works worse          |            | --                                 |
 
-**Total improvement: −0.5667** (32.7% relative reduction from baseline)
+**Total improvement: −0.5669** (32.7% relative reduction from baseline)
 
 ## Reflections
 
