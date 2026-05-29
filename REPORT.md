@@ -3,7 +3,7 @@
 **Goal:** Minimise validation loss on Hacker News titles (100k, 7 epochs, seed=1337).
 **Final best:** 28L×256d×10240 + Muon+AdamW + WSD + RoPE + SwigLU + tie_weights + token_anchor → **val_loss = 1.1650 - 1.1660**
 
-The best result (with val_loss: 1.165-1.166) comes from an experiment in [group 12 baseline](#group-12--mamba-hybrid-first-layer).
+The best result (with val_loss: 1.165-1.166) comes from **g12_00** in [group 12 baseline](#group-12--mamba-hybrid-first-layer).
 
 Key drivers behind performance (in terms of val loss) comes from:
 - Muon optimiser
@@ -416,19 +416,19 @@ n_kv_heads: 4
 
 **Key finding:** Gains are marginal across all VE configs. vocab=10k+VE rows benefit more from the vocab change than from VE itself. gate_channels makes no meaningful difference.
 
-| Exp | Config delta | val_loss | Δ | Params | tok/s |
-| --- | --- | --- | --- | --- | --- |
-| g11_00 | — | 1.1701 | -0.5618 | 26.6M | 41,602 |
-| g11_01 | 28L+2E@9,19 | 1.1699 | -0.0002 | 34.8M | 40,605 |
-| g11_02 | 28L+3E@9,18,27 | 1.1695 | -0.0006 | 38.89M | 40,329 |
-| g11_03 | 28L+2E@9,19, ve_gate_channels=16 | 1.1702 | +0.0001 | 34.8M | 40,526 |
-| g11_04 | 28L+3E@9,18,27, vocab_size=10240 | 1.1662 | -0.0039 | 32.99M | 42,169 |
-| g11_05 | 28L+3E@9,18,27, vocab_size=8192 | 1.1933 | +0.0232 | 30.9M | 42,906 |
-| g11_06 | 28L+4E@3,11,19,27 | 1.1696 | -0.0005 | 42.99M | 39,742 |
-| g11_07 | 28L+2E@13,27 | 1.1694 | -0.0007 | 34.8M | 40,456 |
-| g11_08 | vocab_size=10240, 28L | 1.1666 | -0.0035 | 25.13M | 42,842 |
-| g11_9 | vocab_size=10240, 28L+5E@7,12,17,22,27 | 1.1661 | -0.0040 | 38.24M | 41,682 |
-| g11_10 | vocab_size=10240, 28L+4E@3,11,19,27 | 1.1654 | -0.0047 | 35.62M | 41,728 |
+| Exp        | Config delta                                             | val_loss   | Δ           | Params     | tok/s      |
+|------------|----------------------------------------------------------|------------|-------------|------------|------------|
+| g11_00     | —                                                        | 1.1701     | -0.5618     | 26.6M      | 41,602     |
+| g11_01     | 28L+2E@9,19                                              | 1.1699     | -0.0002     | 34.8M      | 40,605     |
+| g11_02     | 28L+3E@9,18,27                                           | 1.1695     | -0.0006     | 38.89M     | 40,329     |
+| g11_03     | 28L+2E@9,19, ve_gate_channels=16                         | 1.1702     | +0.0001     | 34.8M      | 40,526     |
+| g11_04     | 28L+3E@9,18,27, vocab_size=10240                         | 1.1662     | -0.0039     | 32.99M     | 42,169     |
+| g11_05     | 28L+3E@9,18,27, vocab_size=8192                          | 1.1933     | +0.0232     | 30.9M      | 42,906     |
+| g11_06     | 28L+4E@3,11,19,27                                        | 1.1696     | -0.0005     | 42.99M     | 39,742     |
+| g11_07     | 28L+2E@13,27                                             | 1.1694     | -0.0007     | 34.8M      | 40,456     |
+| g11_08     | vocab_size=10240, 28L                                    | 1.1666     | -0.0035     | 25.13M     | 42,842     |
+| g11_9      | vocab_size=10240, 28L+5E@7,12,17,22,27                   | 1.1661     | -0.0040     | 38.24M     | 41,682     |
+| g11_10     | vocab_size=10240, 28L+4E@3,11,19,27                      | 1.1654     | -0.0047     | 35.62M     | 41,728     |
 | **g11_11** | **vocab_size=10240, 28L+4E@3,11,19,27, muon_lr=0.025 ✓** | **1.1651** | **-0.0050** | **35.62M** | **41,772** |
 
 ---
