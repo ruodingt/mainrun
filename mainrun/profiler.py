@@ -86,7 +86,7 @@ class ProfilerMixin:
         with tprofile(
             activities=activities,
             record_shapes=False,
-            with_stack=False,
+            with_stack=True,
             profile_memory=True,
             on_trace_ready=torch.profiler.tensorboard_trace_handler(output),
         ) as prof:

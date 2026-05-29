@@ -6,60 +6,179 @@ Usage:
 """
 
 import csv
+import yaml
 from pathlib import Path
 from collect_results import collect, load_full_yaml, load_ablations_base
 
 ROOT = Path(__file__).parent.parent
-OUT = ROOT / "REPORT.md"
+OUT  = ROOT / "REPORT.md"
 
+
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
 
 def fmt(v, decimals=4):
     return f"{v:.{decimals}f}" if v is not None else "—"
 
 
 def fmtv(v) -> str:
-    """Format a yaml value for display in a markdown table cell."""
-    if v is None:
-        return "—"
-    if isinstance(v, bool):
-        return f"`{v}`"
+    if v is None:      return "—"
+    if isinstance(v, bool):  return f"`{v}`"
     if isinstance(v, float):
         s = f"{v:.1f}" if v == int(v) else f"{v:g}"
         return f"`{s}`"
-    if isinstance(v, str):
-        return f"`{v}`"
+    if isinstance(v, str):   return f"`{v}`"
     return str(v)
 
 
 def delta(base, val):
-    if base is None or val is None:
-        return ""
+    if base is None or val is None: return ""
     d = val - base
-    sign = "+" if d >= 0 else ""
-    return f"{sign}{d:.4f}"
+    return f"{'+'if d>=0 else ''}{d:.4f}"
+
+
+def short_id(exp_name):
+    """g10_04_separate_kv... → g10_04"""
+    parts = exp_name.split("_")
+    return "_".join(parts[:2])
+
+
+def fmt_layer_pattern(s):
+    """AAAEAAAA... → 8L+1E@3  |  MAAEAAA... → 7L+1M@0+2E@2,6  (0-indexed positions)"""
+    n     = len(s)
+    e_pos = [i for i, c in enumerate(s) if c == 'E']
+    m_pos = [i for i, c in enumerate(s) if c == 'M']
+    parts = [f"{n}L"]
+    if m_pos:
+        parts.append(f"{len(m_pos)}M@{','.join(map(str, m_pos))}")
+    if e_pos:
+        parts.append(f"{len(e_pos)}E@{','.join(map(str, e_pos))}")
+    return "+".join(parts)
+
+
+def fmt_delta_cfg(d):
+    """Format a YAML experiment delta dict into a readable config string."""
+    if not d:
+        return "—"
+    parts = []
+    for k, v in d.items():
+        if k == "layer_pattern":
+            parts.append(fmt_layer_pattern(v))
+        elif isinstance(v, bool):
+            parts.append(f"{k}={'true' if v else 'false'}")
+        elif isinstance(v, float):
+            parts.append(f"{k}={v:g}")
+        elif isinstance(v, str):
+            parts.append(f"{k}={v}")
+        else:
+            parts.append(f"{k}={v}")
+    return ", ".join(parts)
 
 
 def table(headers, rows):
-    lines = []
-    lines.append("| " + " | ".join(headers) + " |")
-    lines.append("| " + " | ".join("---" for _ in headers) + " |")
+    lines  = ["| " + " | ".join(headers) + " |"]
+    lines += ["| " + " | ".join("---" for _ in headers) + " |"]
     for row in rows:
         lines.append("| " + " | ".join(str(c) for c in row) + " |")
     return "\n".join(lines)
 
 
-def _bubble_from_trace():
-    """Parse the most recent .pt.trace.json for accurate GPU utilisation stats.
-    Returns dict with keys: gpu_busy_ms, gpu_span_ms, bubble_ms, busy_pct, steps, n_gaps.
-    Returns None if no trace file found.
+# ---------------------------------------------------------------------------
+# YAML group loader
+# ---------------------------------------------------------------------------
+
+def load_ablations_groups():
+    path = ROOT / "mainrun" / "configs" / "ablations.yaml"
+    with open(path) as f:
+        return yaml.safe_load(f).get("groups", [])
+
+
+def group_base_yaml(group):
+    """Render group_base overrides (vs root base) as a fenced YAML block.
+    Returns empty string when group_base is empty (root base — already in Hyperparameter Reference)."""
+    gb = group.get("group_base") or {}
+    if not gb:
+        return ""
+    return "```yaml\n" + yaml.dump(gb, default_flow_style=False, sort_keys=False).strip() + "\n```"
+
+
+# ---------------------------------------------------------------------------
+# Auto table generator
+# ---------------------------------------------------------------------------
+
+def make_group_table(group, data, initial_base_loss, external_base_name=None):
     """
+    Build a markdown table from a YAML group definition.
+
+    Base row  → Δ vs initial_base_loss (shows cumulative progress)
+    Other rows → Δ vs base row val_loss
+    Config delta column = fmt_delta_cfg(experiment.delta)
+    Rows with no val_loss data are silently skipped (except base).
+    Best val_loss across all rows marked ✓.
+
+    external_base_name: inject an experiment from another group as the base row
+                        (used when the YAML group has no explicit base experiment,
+                        e.g. group7 uses g6_05 as its reference).
+    """
+    exps  = group.get("experiments", [])
+    items = []   # (name, delta_dict, is_base)
+
+    if external_base_name:
+        items.append((external_base_name, {}, True))
+        for e in exps:
+            items.append((e["name"], e.get("delta") or {}, False))
+    elif exps:
+        items.append((exps[0]["name"], exps[0].get("delta") or {}, True))
+        for e in exps[1:]:
+            items.append((e["name"], e.get("delta") or {}, False))
+
+    if not items:
+        return ""
+
+    # Drop non-base rows that have no logged result
+    items = [(n, d, ib) for n, d, ib in items
+             if ib or data.get(n, {}).get("val_loss") is not None]
+
+    base_loss = data.get(items[0][0], {}).get("val_loss") if items else None
+
+    # Best = minimum val_loss across all rows that have data
+    all_vals  = [(n, data[n]["val_loss"]) for n, _, _ in items if data.get(n, {}).get("val_loss") is not None]
+    best_name = min(all_vals, key=lambda x: x[1])[0] if all_vals else None
+
+    rows = []
+    for name, exp_delta, is_base in items:
+        r    = data.get(name, {})
+        cfg  = fmt_delta_cfg(exp_delta)
+        d    = delta(initial_base_loss if is_base else base_loss, r.get("val_loss"))
+        best = name == best_name
+        row  = [
+            short_id(name),
+            cfg + (" ✓" if best else ""),
+            fmt(r.get("val_loss")),
+            d,
+            f"{r.get('params_M', '—')}M",
+            f"{r.get('tok_s', '—'):,}" if r.get("tok_s") else "—",
+        ]
+        if best:
+            row = [f"**{c}**" for c in row]
+        rows.append(row)
+
+    return table(["Exp", "Config delta", "val_loss", "Δ", "Params", "tok/s"], rows)
+
+
+# ---------------------------------------------------------------------------
+# GPU profiling appendix (reads profile_out/)
+# ---------------------------------------------------------------------------
+
+def _bubble_from_trace():
     import json, glob
     traces = sorted(glob.glob(str(ROOT / "profile_out" / "*.pt.trace.json")))
     if not traces:
         return None
     with open(traces[-1]) as fp:
         data = json.load(fp)
-    events = data["traceEvents"]
+    events  = data["traceEvents"]
     gpu_evs = sorted(
         [e for e in events if e.get("cat") in ("kernel", "gpu_memcpy") and "ts" in e and "dur" in e],
         key=lambda e: e["ts"],
@@ -80,19 +199,15 @@ def _bubble_from_trace():
     steps = max(len(fwdbwd_ts) // 2, 1)
     n_gaps = sum(1 for i in range(len(merged) - 1) if merged[i+1][0] - merged[i][1] > 10)
     return dict(
-        gpu_busy_ms=gpu_busy_us / 1e3,
-        gpu_span_ms=gpu_span_us / 1e3,
-        bubble_ms=bubble_us / 1e3,
-        busy_pct=gpu_busy_us / gpu_span_us * 100,
-        steps=steps,
-        n_gaps=n_gaps,
+        gpu_busy_ms=gpu_busy_us / 1e3, gpu_span_ms=gpu_span_us / 1e3,
+        bubble_ms=bubble_us / 1e3, busy_pct=gpu_busy_us / gpu_span_us * 100,
+        steps=steps, n_gaps=n_gaps,
     )
 
 
 def profiling_section() -> str:
     profile_md  = ROOT / "profile_out" / "report.md"
     rocprof_csv = ROOT / "profile_out" / "rocprof.stats.csv"
-
     if not profile_md.exists() and not rocprof_csv.exists():
         return ""
 
@@ -117,7 +232,6 @@ def profiling_section() -> str:
                 lines.append(line)
         lines.append("")
 
-    # GPU utilisation from torch profiler trace (most accurate source)
     tb = _bubble_from_trace()
     if tb:
         s = tb["steps"]
@@ -143,46 +257,49 @@ def profiling_section() -> str:
         ]
 
     if rocprof_csv.exists():
-        rows = []
+        rrows = []
         with open(rocprof_csv, newline="") as f:
             for row in csv.reader(f):
                 if len(row) < 5:
                     continue
                 try:
-                    rows.append((row[0].strip('"'), int(row[1]), int(row[2]), int(row[3]), float(row[4])))
+                    rrows.append((row[0].strip('"'), int(row[1]), int(row[2]), int(row[3]), float(row[4])))
                 except ValueError:
                     continue
-        rows.sort(key=lambda x: -x[2])
+        rrows.sort(key=lambda x: -x[2])
         lines += [
             "### Top Kernels by GPU Time (rocprof --stats)", "",
             "| Kernel | Calls | Total | Avg | % |",
             "|---|---|---|---|---|",
         ]
-        for name, calls, total_ns, avg_ns, pct in rows[:15]:
+        for name, calls, total_ns, avg_ns, pct in rrows[:15]:
             lines.append(f"| `{name[:55]}` | {calls} | {total_ns/1e6:.1f}ms | {avg_ns/1e3:.0f}µs | {pct:.1f}% |")
         lines.append("")
 
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
     data = {r["exp"]: r for r in collect()}
 
-    ablations_base = load_ablations_base()   # flat dict from ablations.yaml root base
-    best_yaml = load_full_yaml("g12_00_base")
+    ablations_base = load_ablations_base()
+    best_yaml      = load_full_yaml("g12_00_base")
+    groups_list    = load_ablations_groups()
+    groups         = {g["name"]: g for g in groups_list}
 
-    def bv(key):
-        return fmtv(ablations_base.get(key))
+    def bv(key):     return fmtv(ablations_base.get(key))
+    def bestv(s, k): return fmtv(best_yaml.get(s, {}).get(k))
 
-    def bestv(section, key):
-        return fmtv(best_yaml.get(section, {}).get(key))
+    initial_base = data["g1_00_baseline"]["val_loss"]
+    best_loss    = data["g12_00_base"]["val_loss"]
 
-    base_loss = data["g1_00_baseline"]["val_loss"]
-    best_loss = data["g12_00_base"]["val_loss"]
-
-    base_lp = ablations_base.get("layer_pattern", "")
+    base_lp  = ablations_base.get("layer_pattern", "")
     best_arch = best_yaml.get("arch", {})
-    best_lp = best_arch.get("layer_pattern", "")
+    best_lp  = best_arch.get("layer_pattern", "")
 
     sections = []
 
@@ -193,8 +310,8 @@ def main():
 # Ablation Study Report
 
 **Goal:** Minimise validation loss on Hacker News titles (100k, 7 epochs, seed=1337).
-**Baseline:** SGD + cosine LR + learned pos emb + GELU + {len(base_lp)}L×{ablations_base.get('d_model')}d×{ablations_base.get('vocab_size')} → **val_loss = {base_loss}**
-**Final best:** {len(best_lp)}L×{best_arch.get('d_model')}d×{best_arch.get('vocab_size')} + Muon+AdamW + WSD + RoPE + SwigLU + tie_weights + token_anchor → **val_loss = {best_loss}**
+**Baseline:** SGD + cosine LR + learned pos emb + GELU + {len(base_lp)}L×{ablations_base.get('d_model')}d×{ablations_base.get('vocab_size')} → **val_loss = {initial_base}**
+**Final best:** {len(best_lp)}L×{best_arch.get('d_model')}d×{best_arch.get('vocab_size')} + Muon+AdamW + WSD + RoPE + SwigLU + tie_weights + token_anchor → **val_loss = {fmt(best_loss)}**
 
 ---
 
@@ -278,290 +395,151 @@ def main():
 """)
 
     # -------------------------------------------------------------------------
-    # Group 1: Optimizer
+    # Group 1 — Optimizer & Schedule
     # -------------------------------------------------------------------------
-    base = data["g1_00_baseline"]["val_loss"]
-    g1_rows = [
-        ("g1_00_baseline",  "SGD + cosine + learned",         "g1_00"),
-        ("g1_01_muon",      "Muon+AdamW",                      "g1_01"),
-        ("g1_06_muon_clip_adamw", "Muon + AdamW clip",         "g1_06"),
-        ("g1_08_muon_rope", "Muon + RoPE",                     "g1_08"),
-        ("g1_09_muon_wsd",  "Muon + WSD",                      "g1_09"),
-        ("g1_11_muon_rope_wsd", "**Muon + RoPE + WSD** ✓",    "g1_11"),
-        ("g1_12_muon_rope_init_wsd", "Muon + RoPE + WSD + muon_uniform_init", "g1_12"),
-    ]
-    rows = []
-    for exp, desc, _ in g1_rows:
-        r = data.get(exp, {})
-        rows.append([desc, fmt(r.get("val_loss")), delta(base, r.get("val_loss")),
-                     f"{r.get('params_M', '—')}M", f"{r.get('tok_s', '—'):,}" if r.get('tok_s') else "—"])
     sections.append(f"""\
 ## Group 1 — Optimizer & Schedule
 
-Base: 6L×512d, GELU, SGD+cosine+learned_pos
 **Key finding:** Muon+AdamW with RoPE+WSD gives the biggest single jump (−0.54).
 gpt2 init beats muon_uniform init.
 
-{table(["Config", "val_loss", "Δ vs baseline", "Params", "tok/s"], rows)}
+{make_group_table(groups["group1"], data, initial_base)}
 
 ---
 """)
 
     # -------------------------------------------------------------------------
-    # Group 2: Activation + Arch tricks (6L×512d, now with best optimizer)
+    # Group 2 — Activation & Architecture Tricks
     # -------------------------------------------------------------------------
-    base2 = data["g2_00_base"]["val_loss"]
-    g2_rows = [
-        ("g2_00_base",        "base (GELU, no tie)"),
-        ("g2_05_tie_weights", "tie_weights"),
-        ("g2_07_swiglu",      "SwigLU"),
-        ("g2_08_relu_sq",     "ReLU²"),
-        ("g2_09_swiglu_tie",  "**SwigLU + tie** ✓"),
-        ("g2_10_relu_sq_tie", "ReLU² + tie"),
-        ("g2_01_token_anchor","token_anchor"),
-        ("g2_02_softcap",     "logit_softcap=30"),
-        ("g2_04_mqa",         "MQA (n_kv=1)"),
-    ]
-    rows = []
-    for exp, desc in g2_rows:
-        r = data.get(exp, {})
-        rows.append([desc, fmt(r.get("val_loss")), delta(base2, r.get("val_loss")),
-                     f"{r.get('params_M', '—')}M", f"{r.get('tok_s', '—'):,}" if r.get('tok_s') else "—"])
     sections.append(f"""\
 ## Group 2 — Activation & Architecture Tricks (6L×512d)
 
-Base: 6L×512d + Muon+AdamW+RoPE+WSD
+{group_base_yaml(groups["group2"])}
+
 **Key finding:** SwigLU + tie_weights = best combo (−0.012). token_anchor, softcap, MQA all neutral at 6L.
 
-{table(["Config", "val_loss", "Δ vs g2_base", "Params", "tok/s"], rows)}
+{make_group_table(groups["group2"], data, initial_base)}
 
 ---
 """)
 
     # -------------------------------------------------------------------------
-    # Group 3: Confirm best config (swiglu+tie) — arch tricks at 6L×512d
+    # Group 3 — Confirm Best Config
     # -------------------------------------------------------------------------
-    base3 = data["g3_00_base"]["val_loss"]
-    g3_rows = [
-        ("g3_00_base",         "base (swiglu+tie+rope+muon+wsd)"),
-        ("g3_01_rmsnorm",      "RMSNorm"),
-        ("g3_02_token_anchor", "token_anchor"),
-        ("g3_03_softcap",      "logit_softcap=30"),
-        ("g3_04_mqa",          "MQA"),
-        ("g3_05_anchor_softcap","anchor + softcap"),
-    ]
-    rows = []
-    for exp, desc in g3_rows:
-        r = data.get(exp, {})
-        rows.append([desc, fmt(r.get("val_loss")), delta(base3, r.get("val_loss")),
-                     f"{r.get('params_M', '—')}M"])
     sections.append(f"""\
 ## Group 3 — Confirm Best Config (6L×512d)
 
-Base: 6L×512d + Muon+AdamW+RoPE+WSD + SwigLU + tie_weights
+{group_base_yaml(groups["group3"])}
+
 **Key finding:** All tricks neutral or slightly negative at shallow depth. Best config = base.
 
-{table(["Config", "val_loss", "Δ vs g3_base", "Params"], rows)}
+{make_group_table(groups["group3"], data, initial_base)}
 
 ---
 """)
 
     # -------------------------------------------------------------------------
-    # Group 4: Vocab + depth at 6L
+    # Group 4 — Vocab Size & Depth
     # -------------------------------------------------------------------------
-    base4 = data["g4_00_base"]["val_loss"]
-    g4_rows = [
-        ("g4_00_base",   "6L×512d, vocab=16k"),
-        ("g4_01_8k",     "vocab=8k"),
-        ("g4_02_12A",    "12L×512d, vocab=16k"),
-        ("g4_03_8k_12A", "12L×512d, vocab=8k"),
-    ]
-    rows = []
-    for exp, desc in g4_rows:
-        r = data.get(exp, {})
-        rows.append([desc, fmt(r.get("val_loss")), delta(base4, r.get("val_loss")),
-                     f"{r.get('params_M', '—')}M"])
     sections.append(f"""\
 ## Group 4 — Vocab Size & Depth (6L)
 
+{group_base_yaml(groups["group4"])}
+
 **Key finding:** vocab=16k is optimal; 8k hurts. Adding layers at 512d doesn't help — motivates architecture search.
 
-{table(["Config", "val_loss", "Δ vs g4_base", "Params"], rows)}
+{make_group_table(groups["group4"], data, initial_base)}
 
 ---
 """)
 
     # -------------------------------------------------------------------------
-    # Group 5: Arch search 30M
+    # Group 5 — Architecture Search ~30M
     # -------------------------------------------------------------------------
-    base5 = data["g5_00_base"]["val_loss"]
-    g5_rows = [
-        ("g5_00_base",     "6L×512d  (base)"),
-        ("g5_06_4L_640",   "4L×640d"),
-        ("g5_05_5L_576",   "5L×576d"),
-        ("g5_01_8L_448",   "8L×448d"),
-        ("g5_02_9L_448",   "9L×448d"),
-        ("g5_04_13L_384",  "13L×384d"),
-        ("g5_03_12L_384",  "**12L×384d** ✓"),
-    ]
-    rows = []
-    for exp, desc in g5_rows:
-        r = data.get(exp, {})
-        rows.append([desc, fmt(r.get("val_loss")), delta(base5, r.get("val_loss")),
-                     f"{r.get('params_M', '—')}M", f"{r.get('tok_s', '—'):,}" if r.get('tok_s') else "—"])
     sections.append(f"""\
 ## Group 5 — Architecture Search (~30M params)
 
-Fixed: Muon+AdamW+RoPE+WSD+SwigLU+tie+vocab16k
+{group_base_yaml(groups["group5"])}
+
 **Key finding:** Deeper-narrower consistently wins. 12L×384d = best at 30M budget.
 
-{table(["Config", "val_loss", "Δ vs base", "Params", "tok/s"], rows)}
+{make_group_table(groups["group5"], data, initial_base)}
 
 ---
 """)
 
     # -------------------------------------------------------------------------
-    # Group 6: Arch search 40M + GQA
+    # Group 6 — Architecture Search ~40M + GQA
     # -------------------------------------------------------------------------
-    base6 = data["g6_00_base"]["val_loss"]
-    g6_rows = [
-        ("g6_00_base",         "12L×384d  (base)"),
-        ("g6_01_14L_384",      "14L×384d"),
-        ("g6_02_16L_384",      "16L×384d"),
-        ("g6_08_16L_384_gqa2", "16L×384d GQA-2"),
-        ("g6_03_18L_384",      "18L×384d"),
-        ("g6_04_19L_384",      "19L×384d"),
-        ("g6_09_21L_384_gqa2", "21L×384d GQA-2"),
-        ("g6_06_24L_320",      "24L×320d"),
-        ("g6_07_28L_320",      "28L×320d"),
-        ("g6_05_20L_320",      "**20L×320d** ✓"),
-    ]
-    rows = []
-    for exp, desc in g6_rows:
-        r = data.get(exp, {})
-        rows.append([desc, fmt(r.get("val_loss")), delta(base6, r.get("val_loss")),
-                     f"{r.get('params_M', '—')}M", f"{r.get('tok_s', '—'):,}" if r.get('tok_s') else "—"])
     sections.append(f"""\
 ## Group 6 — Architecture Search (~40M params) + GQA
 
+{group_base_yaml(groups["group6"])}
+
 **Key finding:** Deeper-narrower trend continues. GQA does not help. 20L×320d = best.
 
-{table(["Config", "val_loss", "Δ vs base", "Params", "tok/s"], rows)}
+{make_group_table(groups["group6"], data, initial_base)}
 
 ---
 """)
 
     # -------------------------------------------------------------------------
-    # Group 7: 256d at depth
+    # Group 7 — 256d at depth
+    # Group 7 has no explicit base experiment in YAML; use g6_05_20L_320 as reference.
     # -------------------------------------------------------------------------
-    g7_rows = [
-        ("g7_01_28L_256", "**28L×256d** ✓"),
-        ("g7_02_32L_256", "32L×256d"),
-        ("g7_03_36L_256", "36L×256d"),
-        ("g7_04_40L_256", "40L×256d"),
-        ("g7_05_44L_256", "44L×256d"),
-    ]
     best_g6 = data["g6_05_20L_320"]["val_loss"]
-    rows = []
-    for exp, desc in g7_rows:
-        r = data.get(exp, {})
-        rows.append([desc, fmt(r.get("val_loss")), delta(best_g6, r.get("val_loss")),
-                     f"{r.get('params_M', '—')}M", f"{r.get('tok_s', '—'):,}" if r.get('tok_s') else "—"])
     sections.append(f"""\
 ## Group 7 — Narrow-and-Deep: 256d at Various Depths
 
-Base for Δ: best from group6 (20L×320d = {fmt(best_g6)})
+{group_base_yaml(groups["group7"])}
+
+Base for Δ: best from group6 (g6_05 = 20L×320d, val_loss={fmt(best_g6)})
 **Key finding:** 28L×256d slightly edges out 20L×320d. Diminishing returns beyond 28L.
 
-{table(["Config", "val_loss", "Δ vs g6_best", "Params", "tok/s"], rows)}
+{make_group_table(groups["group7"], data, initial_base, external_base_name="g6_05_20L_320")}
 
 ---
 """)
 
     # -------------------------------------------------------------------------
-    # Group 8: Depth-dependent tricks on 28L×256d
+    # Group 8 — Depth-Dependent Tricks
     # -------------------------------------------------------------------------
-    base8 = data["g8_00_base"]["val_loss"]
-    g8_rows = [
-        ("g8_00_base",          "28L×256d  (base)"),
-        ("g8_01_anchor",        "**token_anchor** ✓"),
-        ("g8_02_softcap",       "logit_softcap=30"),
-        ("g8_03_anchor_softcap","anchor + softcap"),
-        ("g8_04_anchor_scale",  "anchor + resid_scale"),
-        ("g8_07_rezero",        "ReZero"),
-        ("g8_06_anchor_rezero", "anchor + ReZero"),
-        ("g8_05_all",           "anchor + softcap + scale"),
-    ]
-    rows = []
-    for exp, desc in g8_rows:
-        r = data.get(exp, {})
-        rows.append([desc, fmt(r.get("val_loss")), delta(base8, r.get("val_loss")),
-                     f"{r.get('params_M', '—')}M"])
     sections.append(f"""\
 ## Group 8 — Depth-Dependent Tricks (28L×256d)
+
+{group_base_yaml(groups["group8"])}
 
 **Key finding:** token_anchor helps at depth (−0.0013). softcap and resid_scale neutral or negative. ReZero mildly negative.
 Note: token_anchor was neutral at 6L (group3) — it is depth-dependent.
 
-{table(["Config", "val_loss", "Δ vs g8_base", "Params"], rows)}
+{make_group_table(groups["group8"], data, initial_base)}
 
 ---
 """)
 
     # -------------------------------------------------------------------------
-    # Group 9: Value residual
+    # Group 9 — Value Skip Connections
     # -------------------------------------------------------------------------
-    base9 = data["g9_00_base"]["val_loss"]
-    g9_rows = [
-        ("g9_00_base",             "28L×256d + anchor  (base)"),
-        ("g9_01_value_res",        "v += x (current layer)"),
-        ("g9_02_value_res_anchor", "v += x + anchor"),
-        ("g9_05_value_res_x0",     "v += x₀ (original emb)"),
-        ("g9_06_value_res_x0_anchor","v += x₀ + anchor"),
-        ("g9_07_both_res",         "v += x + x₀"),
-        ("g9_08_value_carry",      "v += λ·v_{l-1}"),
-        ("g9_09_value_carry_anchor","v += λ·v_{l-1} + anchor"),
-        ("g9_10_anchor_only",      "**anchor only** ✓"),
-    ]
-    rows = []
-    for exp, desc in g9_rows:
-        r = data.get(exp, {})
-        rows.append([desc, fmt(r.get("val_loss")), delta(base9, r.get("val_loss")),
-                     f"{r.get('params_M', '—')}M"])
     sections.append(f"""\
 ## Group 9 — Value Skip Connections (28L×256d)
+
+{group_base_yaml(groups["group9"])}
 
 Three variants tested: v += x (current-layer residual), v += x₀ (original embedding), v += λ·v_{{l-1}} (cross-layer carry).
 **Key finding:** All value residual variants are ≥ anchor alone. Anchor-only = best.
 
-{table(["Config", "val_loss", "Δ vs g9_base", "Params"], rows)}
+{make_group_table(groups["group9"], data, initial_base)}
 
 ---
 """)
 
     # -------------------------------------------------------------------------
-    # Group 10: Vocab sweep + architecture experiments
+    # Group 10 — Vocab Sweep + Architecture Variants
     # -------------------------------------------------------------------------
-    base10 = data["g10_00_base"]["val_loss"]
-    g10_rows = [
-        ("g10_00_base",                  "28L×256d, vocab=16k (base)"),
-        ("g10_01_vocab10k",              "**vocab=10240** ✓"),
-        ("g10_02_vocab12k",              "vocab=12288"),
-        ("g10_03_vocab8k",               "vocab=8192"),
-        ("g10_04_separate_kv_vocab_10k", "separate_kv, vocab=10k"),
-        ("g10_05_spectral_clip",         "spectral_clip=1.0, vocab=10k"),
-        ("g10_06_muon_attn_only",        "muon_attn_only (MLP→AdamW)"),
-        ("g10_08_mlp2x",                 "MLP hidden=512 (mlp_expand=3.0)"),
-        ("g10_09_mlp1p5x",              "MLP hidden=384 (mlp_expand=2.25)"),
-    ]
-    rows = []
-    for exp, desc in g10_rows:
-        r = data.get(exp, {})
-        rows.append([desc, fmt(r.get("val_loss")), delta(base10, r.get("val_loss")),
-                     f"{r.get('tok_s', '—'):,}" if r.get('tok_s') else "—",
-                     f"{r.get('params_M', '—')}M"])
     sections.append(f"""\
 ## Group 10 — Vocab Size & Architecture Variants (28L×256d)
+
+{group_base_yaml(groups["group10"])}
 
 **Key findings:**
 - vocab=10240 beats 16k (−0.004); 8k and 12k both hurt
@@ -570,42 +548,14 @@ Three variants tested: v += x (current-layer residual), v += x₀ (original embe
 - `muon_attn_only`: routes MLP matrices to AdamW — catastrophic (+0.041); Muon is essential for MLP
 - Smaller MLP (hidden=512/384): −27%/−45% params, slight loss increase — compression headroom exists but costs quality
 
-{table(["Config", "val_loss", "Δ vs base", "tok/s", "Params"], rows)}
+{make_group_table(groups["group10"], data, initial_base)}
 
 ---
 """)
 
     # -------------------------------------------------------------------------
-    # Group 11: Value Embeddings (E layers)
+    # Group 11 — Value Embeddings
     # -------------------------------------------------------------------------
-    base10_vocab10k = data["g10_01_vocab10k"]["val_loss"]
-    base10_vocab16k = data["g10_00_base"]["val_loss"]
-    g11_vocab16k_rows = [
-        ("g11_01_ve_2e",       "2E layers (pos 9,19)"),
-        ("g11_07_ve_2e",       "2E layers (pos 13,27)"),
-        ("g11_03_ve_2e_gate16","2E layers (pos 9,19), gate_ch=16"),
-        ("g11_02_ve_3e",       "3E layers (pos 9,18,27)"),
-        ("g11_06_ve_4e",       "4E layers (pos 3,11,19,27)"),
-    ]
-    g11_vocab10k_rows = [
-        ("g11_08_vocab10k",                "28A, no VE (baseline)"),
-        ("g11_04_3e_vocab10k",             "3E layers (pos 9,18,27)"),
-        ("g11_10_vocab10k_4ve_i8",         "4E layers (pos 3,11,19,27) ✓"),
-        ("g11_11_mlr0025_vocab10k_4ve_i8", "4E layers, muon_lr=0.025"),
-        ("g11_9_vocab10k_5ve_i7",          "5E layers (pos 7,12,17,22,27)"),
-    ]
-    rows16 = []
-    for exp, desc in g11_vocab16k_rows:
-        r = data.get(exp, {})
-        rows16.append([desc, fmt(r.get("val_loss")), delta(base10_vocab16k, r.get("val_loss")),
-                       f"{r.get('tok_s', '—'):,}" if r.get('tok_s') else "—",
-                       f"{r.get('params_M', '—')}M"])
-    rows10 = []
-    for exp, desc in g11_vocab10k_rows:
-        r = data.get(exp, {})
-        rows10.append([desc, fmt(r.get("val_loss")), delta(base10_vocab10k, r.get("val_loss")),
-                       f"{r.get('tok_s', '—'):,}" if r.get('tok_s') else "—",
-                       f"{r.get('params_M', '—')}M"])
     sections.append(f"""\
 ## Group 11 — Value Embeddings / E Layers (ResFormer-style)
 
@@ -613,52 +563,32 @@ Dedicated per-layer embedding tables injected into V via a learned per-head gate
 `v += 3·σ(Linear(x[:12])) * ve_table(idx)`. Layer type `E` in `layer_pattern` enables this;
 embedding tables are separate from `token_emb`, optimised with `emb_lr`.
 
-**Key findings:**
-- vocab=16k: VE consistently helps; 3E (pos 9,18,27) is best (−0.0009)
-- vocab=10k: VE provides marginal and noisy benefit; results across 3E/4E/no-VE are within run variance
-- gate_channels (12 vs 16) makes no meaningful difference
-- 4E (pos 3,11,19,27) selected for final config; validated by g12_00_base re-run (1.1650)
+{group_base_yaml(groups["group11"])}
 
-**vocab=16k** (Δ vs g10\\_00\\_base = {fmt(base10_vocab16k)}):
+**Key finding:** Gains are marginal across all VE configs. vocab=10k+VE rows benefit more from the vocab change than from VE itself. gate_channels makes no meaningful difference.
 
-{table(["Config", "val_loss", "Δ vs 16k base", "tok/s", "Params"], rows16)}
-
-**vocab=10k** (Δ vs g10\\_01 = {fmt(base10_vocab10k)}):
-
-{table(["Config", "val_loss", "Δ vs 10k base", "tok/s", "Params"], rows10)}
-
-Note: g11_10 and g12_00_base use identical config; the spread in their val_loss (1.1667 vs 1.1650) reflects run variance at this scale.
+{make_group_table(groups["group11"], data, initial_base)}
 
 ---
 """)
 
     # -------------------------------------------------------------------------
-    # Group 12: Mamba hybrid
+    # Group 12 — Mamba Hybrid
     # -------------------------------------------------------------------------
-    base12 = data["g12_00_base"]["val_loss"]
-    g12_rows = [
-        ("g12_00_base",        "**best config (pure attention)** ✓"),
-        ("g12_01_mamba_first", "first layer → Mamba SSM"),
-    ]
-    rows = []
-    for exp, desc in g12_rows:
-        r = data.get(exp, {})
-        rows.append([desc, fmt(r.get("val_loss")), delta(base12, r.get("val_loss")),
-                     f"{r.get('tok_s', '—'):,}" if r.get('tok_s') else "—",
-                     f"{r.get('params_M', '—')}M"])
     sections.append(f"""\
 ## Group 12 — Mamba Hybrid (first layer)
 
-Base: best config (28L×256d, vocab=10240, 4E layers, Muon+AdamW+RoPE+WSD)
+{group_base_yaml(groups["group12"])}
+
 **Key finding:** Replacing the first attention layer with Mamba SSM hurts both quality (+0.0076) and throughput (−42% tok/s). Pure attention remains better at this scale and sequence length.
 
-{table(["Config", "val_loss", "Δ vs base", "tok/s", "Params"], rows)}
+{make_group_table(groups["group12"], data, initial_base)}
 
 ---
 """)
 
     # -------------------------------------------------------------------------
-    # Kernel Benchmarks (Appendix)
+    # Kernel Benchmarks Appendix
     # -------------------------------------------------------------------------
     sections.append("""\
 ## Appendix — Custom Kernel Benchmarks
@@ -707,7 +637,7 @@ Note: full-step times measured without `torch.compile` or operator fusion — re
 """)
 
     # -------------------------------------------------------------------------
-    # GPU Profiling (optional — reads profile_out/ if present)
+    # GPU Profiling Appendix
     # -------------------------------------------------------------------------
     prof = profiling_section()
     if prof:
@@ -728,7 +658,7 @@ Note: full-step times measured without `torch.compile` or operator fusion — re
 | Group 8  | → token\\_anchor | 1.1700 | −0.0008 |
 | Group 9  | → confirmed anchor-only best | 1.1696 | −0.0004 |
 | Group 10 | → vocab=10240 | 1.1660 | −0.0036 |
-| Group 11 | → 4E value embeddings, interval=8 | **1.1652** | −0.0008 |
+| Group 11 | → 4E value embeddings (pos 3,11,19,27) | **{fmt(best_loss)}** | {delta(data["g10_01_vocab10k"]["val_loss"], best_loss)} |
 
 **Total improvement: −0.5667** (32.7% relative reduction from baseline)
 """)
@@ -757,21 +687,20 @@ Each group performed single-variable search on top of the previous group's best 
 
 ### 5. Value embedding parameter efficiency was poor
 
-The final architecture includes 4 E-type (value embedding) layers, contributing +10.5M parameters (+42% of the base model) for a val_loss improvement of only −0.0008. No iso-parameter comparison was made: it is unknown whether the same 10.5M parameters spent on additional attention layers, wider d_model, or deeper depth would have yielded greater benefit. We selected 4E because it was the best option within Group 11's search space, but the parameter efficiency of this choice was never challenged against alternatives.
+The final architecture includes 4 E-type (value embedding) layers, contributing +10.5M parameters (+42% of the base model) for a val_loss improvement of −0.0006 vs no-VE baseline. No iso-parameter comparison was made: it is unknown whether the same 10.5M parameters spent on additional attention layers, wider d_model, or deeper depth would have yielded greater benefit. We selected 4E because it was the best option within Group 11's search space, but the parameter efficiency of this choice was never challenged against alternatives.
 
 ### 6. Mamba hybrid did not help
 
 A single experiment (g12_01) replaced the first attention layer with a Mamba SSM layer, keeping all other best-config settings (28L×256d, vocab=10240, 4E layers). Result: val_loss worsened by 0.0076 (1.1650→1.1726) and throughput dropped from 41,947 to 24,174 tok/s — a 42% speed penalty. The 42% speed drop is likely due to the absence of an optimised ROCm Mamba kernel — the selective scan ran without hardware-specific tuning available to Flash Attention. The quality regression suggests that at this scale and sequence length, attention is simply better. Hybrid architectures may have merit at longer sequences or larger scale, but within this project's constraints the result is a clear negative.
 
-### 4. TensorBoard integration added limited value
+### 7. TensorBoard integration added limited value
 
 We integrated TensorBoard (loss curves, LR schedules, weight norms) early in the project. In practice, all experiment tracking and comparison was done through JSONL log files parsed by `collect_results.py`. The TensorBoard writer added code complexity, a `SummaryWriter` dependency, and extra I/O on every training step, with minimal return — the ablation tables in this report were never derived from TensorBoard. A leaner approach would be structured JSONL logging only, with a simple `collect_results.py` for post-hoc analysis.
 
 ---
 """)
 
-    report = "\n".join(sections)
-    OUT.write_text(report)
+    OUT.write_text("\n".join(sections))
     print(f"Report written to {OUT}")
 
 
