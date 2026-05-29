@@ -502,20 +502,13 @@ Profiled on AMD MI355X using `torch.profiler` (CPU + GPU activities). 10 steps a
 | Metric | Value |
 |---|---|
 | Throughput | 35,029 tok/s |
-| GPU Utilisation (Chrome Trace) | **93.8%** |
 | torch.compile graphs | 1 |
 | Graph breaks | **0** |
 | Peak memory allocated | 4.18 GB / 6.45 GB reserved |
 
 **0 graph breaks** means `torch.compile` captured the entire forward + backward as a single compiled graph with no fallback to eager Python. This is the prerequisite for any of the other efficiency numbers to be meaningful.
 
-**93.8% GPU utilisation** is measured from the Chrome Trace timeline (kernel wall time vs total wall time). The remaining 6.2% idle breaks down into:
-
-| Source | Size | Cause |
-|---|---|---|
-| Kernel launch overhead | ~68 ms | ~1,224 HIP kernel dispatches/step × ~5µs/launch |
-| Optimizer bubbles | ~36 ms | 49 gaps >200µs, all following Muon-related kernels; root cause unconfirmed (requires CPU-stack trace) |
-
+GPU idle time was partially characterised via Chrome Trace analysis. Two sources were identified but not fully attributed:
 
 Source trace file can be found in [profile_out](profile_out/). 
 Some initial analysis can be found in [](docs/analysis/profiling.md)

@@ -1,4 +1,5 @@
 """
+# TODO：Experimental Only, GPU util computed is different from rocm-smi
 ProfilerMixin — mixed into Trainer to add profile() without bloating train_hybrid.py.
 
 Outputs:
