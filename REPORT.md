@@ -1,8 +1,18 @@
 # Ablation Study Report
 
 **Goal:** Minimise validation loss on Hacker News titles (100k, 7 epochs, seed=1337).
-**Baseline:** SGD + cosine LR + learned pos emb + GELU + 6L×512d×16000 → **val_loss = 1.7319**
-**Final best:** 28L×256d×10240 + Muon+AdamW + WSD + RoPE + SwigLU + tie_weights + token_anchor → **val_loss = 1.1650**
+**Final best:** 28L×256d×10240 + Muon+AdamW + WSD + RoPE + SwigLU + tie_weights + token_anchor → **val_loss = 1.1650 - 1.660**
+
+The best result (with val_loss: 1.165-1.166) come from an experiment in [group 12 baseline](#group-12--mamba-hybrid-first-layer).
+
+Key drivers behind performance (in terms of val loss) comes from:
+- Moun optimiser
+- Vocab size
+- deeper but narrower models
+
+We have 12 groups of abaltion study which tells the entire journey of pushing down val_loss. 
+
+In terms of training throughput, we used bf16 AMP and torch compile to speed up the training on AMD GPU.
 
 ---
 
@@ -82,6 +92,7 @@
 | `min_lr_frac` | `0.0` | `0.05` | LR decay floor as a fraction of peak LR. `0.0` decays all the way to zero; `0.05` stops at 5% of peak. |
 | `adamw_wd` | — | `0.1` | AdamW weight decay (L2 regularisation coefficient). |
 
+
 ---
 
 ## Group 1 — Optimizer & Schedule
@@ -104,6 +115,12 @@ gpt2 init beats muon_uniform init.
 | g1_10 | optimizer_type=muon_adamw, lr_schedule=wsd, warmup_frac=0.05, min_lr_frac=0.05, weight_init=muon_uniform | 1.2503 | -0.4816 | 35.35M | 57,801 |
 | **g1_11** | **optimizer_type=muon_adamw, pos_emb=rope, lr_schedule=wsd, warmup_frac=0.05, min_lr_frac=0.05 ✓** | **1.1953** | **-0.5366** | **35.29M** | **57,342** |
 | g1_12 | optimizer_type=muon_adamw, pos_emb=rope, lr_schedule=wsd, warmup_frac=0.05, min_lr_frac=0.05, weight_init=muon_uniform | 1.2261 | -0.5058 | 35.29M | 57,142 |
+
+
+Note: baseline 1.7319 rather than 1.754 is most likely come from 2 reasons:
+
+1. no dropout in position embedding in the implementation
+2. Head embedding is untied from the input token embedding
 
 ---
 
@@ -539,16 +556,17 @@ Note: full-step times measured without `torch.compile` or operator fusion — re
 
 ## Summary — Best Config Evolution
 
-| Step | Change | val_loss | Δ |
-|------|--------|----------|---|
-| Baseline | SGD + cosine + learned\_pos + GELU | 1.7319 | — |
-| Group 1  | → Muon+AdamW + RoPE + WSD | 1.1953 | −0.5366 |
-| Group 2  | → SwigLU + tie\_weights | 1.1836 | −0.0117 |
-| Groups 5-7 | → 28L×256d (deep-narrow arch) | 1.1708 | −0.0128 |
-| Group 8  | → token\_anchor | 1.1700 | −0.0008 |
-| Group 9  | → confirmed anchor-only best | 1.1696 | −0.0004 |
-| Group 10 | → vocab=10240 | 1.1660 | −0.0036 |
-| Group 11 | → 4E value embeddings (pos 3,11,19,27) | **1.1650** | -0.0010 |
+| Step       | Change                                 | val_loss   | Δ                                  |
+|------------|----------------------------------------|------------|------------------------------------|
+| Baseline   | SGD + cosine + learned\_pos + GELU     | 1.7319     | --                                 |
+| Group 1    | → Muon+AdamW + RoPE + WSD              | 1.1953     | −0.5366                            |
+| Group 2    | → SwigLU + tie\_weights                | 1.1836     | −0.0117                            |
+| Groups 5-7 | → 28L×256d (deep-narrow arch)          | 1.1708     | −0.0128                            |
+| Group 8    | → token\_anchor                        | 1.1700     | −0.0008                            |
+| Group 9    | → confirmed anchor-only best           | 1.1696     | --                                 |
+| Group 10   | → vocab=10240                          | 1.1660     | −0.0040                            |
+| Group 11   | → 4E value embeddings (pos 3,11,19,27) | **1.1650** | -0.0010 (no significant advantage) |
+| Group 11   | No change - Mamba works worse          |            | --                                 |
 
 **Total improvement: −0.5667** (32.7% relative reduction from baseline)
 
@@ -556,11 +574,11 @@ Note: full-step times measured without `torch.compile` or operator fusion — re
 
 ### 1. Weight initialisation exploration was insufficient
 
-We tested `muon_uniform` vs `gpt2` init in a single group-1 experiment and found `gpt2` wins by 0.03 val_loss. We did not investigate why. One possible confound is weight tying: `lm_head` shares weights with `token_emb`, which may have interacted differently with each init scheme. A cleaner experiment would decouple the two before drawing conclusions.
+Tested `muon_uniform` vs `gpt2` init in a single group-1 experiment and found `gpt2` wins by 0.03 val_loss. Did not investigate why. 
 
 ### 2. Custom kernels before profiling — wrong order
 
-We wrote three Triton kernels (RMSNorm, RoPE, fused CE) before running any profiler. When we eventually profiled the best config with torch profiler traces, GPU utilisation measured from the Chrome Trace was high (>93%) — meaning there was no large dispatch bubble to fix. The correct workflow is: **profile first, identify hot kernels, then write targeted replacements**. Of the three kernels, none ended up in the final training path: RMSNorm is unused (final config uses LayerNorm), RoPE Triton was discovered to be faster only after correcting the benchmark shape late in the project, and fused CE provides memory savings but marginal speed improvement on gfx1151.
+Wrote three Triton kernels (RMSNorm, RoPE, fused CE) before running any profiler. When we eventually profiled the best config with torch profiler traces, GPU utilisation measured from the Chrome Trace was high (>93%) — meaning there was no large dispatch bubble to fix. The correct workflow is: **profile first, identify hot kernels, then write targeted replacements**. Of the three kernels, none ended up in the final training path: RMSNorm is unused (final config uses LayerNorm), RoPE Triton was discovered to be faster only after correcting the benchmark shape late in the project, and fused CE provides memory savings but marginal speed improvement on gfx1151.
 
 ### 3. Vocab size was fixed too early
 
@@ -570,16 +588,8 @@ We wrote three Triton kernels (RMSNorm, RoPE, fused CE) before running any profi
 
 Each group performed single-variable search on top of the previous group's best config. This greedy sequential strategy cannot discover interactions between hyperparameters — for example, the optimal `muon_lr` for 28L×256d may differ from the value inherited from Group 1 (6L×512d), and the optimal depth for a given vocab size was never jointly optimised. We did implement Optuna TPE hyperparameter search (`hypertune.py`) but used it only for a narrow LR sweep rather than as the primary search strategy. Investing more in automatic tuning earlier — using Optuna to jointly search over depth, width, vocab, and LR — would likely have found better configurations faster and with less manual iteration.
 
-### 5. Value embedding parameter efficiency was poor
+### 5. TensorBoard integration added limited value
 
-The final architecture includes 4 E-type (value embedding) layers, contributing +10.5M parameters (+42% of the base model) for a val_loss improvement of −0.0006 vs no-VE baseline. No iso-parameter comparison was made: it is unknown whether the same 10.5M parameters spent on additional attention layers, wider d_model, or deeper depth would have yielded greater benefit. We selected 4E because it was the best option within Group 11's search space, but the parameter efficiency of this choice was never challenged against alternatives.
-
-### 6. Mamba hybrid did not help
-
-A single experiment (g12_01) replaced the first attention layer with a Mamba SSM layer, keeping all other best-config settings (28L×256d, vocab=10240, 4E layers). Result: val_loss worsened by 0.0076 (1.1650→1.1726) and throughput dropped from 41,947 to 24,174 tok/s — a 42% speed penalty. The 42% speed drop is likely due to the absence of an optimised ROCm Mamba kernel — the selective scan ran without hardware-specific tuning available to Flash Attention. The quality regression suggests that at this scale and sequence length, attention is simply better. Hybrid architectures may have merit at longer sequences or larger scale, but within this project's constraints the result is a clear negative.
-
-### 7. TensorBoard integration added limited value
-
-We integrated TensorBoard (loss curves, LR schedules, weight norms) early in the project. In practice, all experiment tracking and comparison was done through JSONL log files parsed by `collect_results.py`. The TensorBoard writer added code complexity, a `SummaryWriter` dependency, and extra I/O on every training step, with minimal return — the ablation tables in this report were never derived from TensorBoard. A leaner approach would be structured JSONL logging only, with a simple `collect_results.py` for post-hoc analysis.
+We integrated TensorBoard (loss curves, LR schedules, weight norms) early in the project. In practice, all experiment tracking and comparison was done through JSONL log files parsed by `collect_results.py`. The TensorBoard writer added code complexity, a `SummaryWriter` dependency, and extra I/O on every training step, with minimal return — the ablation tables in this report can simply be derived from mainrun logs. A leaner approach would be structured JSONL logging only, with a simple `collect_results.py` for post-hoc analysis.
 
 ---
