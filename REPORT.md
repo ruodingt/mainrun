@@ -487,7 +487,9 @@ Source trace file can be found in [profile_out](mainrun/profile_out).
 
 Some initial analysis can be found in [profiling.md](docs/analysis/profiling.md). 
 
-Given we have got pretty high GPU Util, limited gain can be obtained to further explore this direction.
+The remaining idle time is dominated by kernel launch overhead (~68ms). `torch.compile` reduces this by fusing operators into fewer kernels, but per-kernel HIP dispatch cost remains. Eliminating it entirely would require HIP Graphs (`mode="reduce-overhead"`), which ROCm supports but was not tested. 
+
+Overall, the potential gain from further optimisation is limited.
 
 
 ## Appendix — Custom Kernel Benchmarks
@@ -535,12 +537,6 @@ Note: full-step times measured without `torch.compile` or operator fusion — re
 ---
 
 
-## Appendix - Run Experiment
-
-
-task train
-
-
 ## Summary — Best Config Evolution
 
 | Step | Change | val_loss | Δ |
@@ -564,7 +560,7 @@ We tested `muon_uniform` vs `gpt2` init in a single group-1 experiment and found
 
 ### 2. Custom kernels before profiling — wrong order
 
-We wrote three Triton kernels (RMSNorm, RoPE, fused CE) before running any profiler. When we eventually profiled the best config with torch profiler traces, GPU utilisation was already 94.8% — meaning there was no large dispatch bubble to fix. The correct workflow is: **profile first, identify hot kernels, then write targeted replacements**. Of the three kernels, none ended up in the final training path: RMSNorm is unused (final config uses LayerNorm), RoPE Triton was discovered to be faster only after correcting the benchmark shape late in the project, and fused CE provides memory savings but marginal speed improvement on gfx1151.
+We wrote three Triton kernels (RMSNorm, RoPE, fused CE) before running any profiler. When we eventually profiled the best config with torch profiler traces, GPU utilisation measured from the Chrome Trace was high (>93%) — meaning there was no large dispatch bubble to fix. The correct workflow is: **profile first, identify hot kernels, then write targeted replacements**. Of the three kernels, none ended up in the final training path: RMSNorm is unused (final config uses LayerNorm), RoPE Triton was discovered to be faster only after correcting the benchmark shape late in the project, and fused CE provides memory savings but marginal speed improvement on gfx1151.
 
 ### 3. Vocab size was fixed too early
 
