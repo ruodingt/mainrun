@@ -212,17 +212,20 @@ mlp_act: swiglu
 tie_weights: true
 ```
 
+The goal at this stage is to find the impact depth vs width of networks. 
+So total number of parameters is capped at ~30m in this group, making it easier to compare. 
+
 **Key finding:** Deeper-narrower consistently wins. 12L×384d = best at 30M budget.
 
-| Exp | Config delta | val_loss | Δ | Params | tok/s |
-| --- | --- | --- | --- | --- | --- |
-| g5_00 | — | 1.1842 | -0.5477 | 26.88M | 60,129 |
-| g5_01 | 8L, d_model=448, n_q_head=7, n_kv_heads=7 | 1.1780 | -0.0062 | 26.68M | 48,746 |
-| g5_02 | 9L, d_model=448, n_q_head=7, n_kv_heads=7 | 1.1772 | -0.0070 | 29.12M | 46,288 |
+| Exp       | Config delta                                     | val_loss   | Δ           | Params    | tok/s      |
+|-----------|--------------------------------------------------|------------|-------------|-----------|------------|
+| g5_00     | —                                                | 1.1842     | -0.5477     | 26.88M    | 60,129     |
+| g5_01     | 8L, d_model=448, n_q_head=7, n_kv_heads=7        | 1.1780     | -0.0062     | 26.68M    | 48,746     |
+| g5_02     | 9L, d_model=448, n_q_head=7, n_kv_heads=7        | 1.1772     | -0.0070     | 29.12M    | 46,288     |
 | **g5_03** | **12L, d_model=384, n_q_head=6, n_kv_heads=6 ✓** | **1.1727** | **-0.0115** | **27.4M** | **46,046** |
-| g5_04 | 13L, d_model=384, n_q_head=6, n_kv_heads=6 | 1.1736 | -0.0106 | 29.17M | 43,970 |
-| g5_05 | 5L, d_model=576, n_q_head=9, n_kv_heads=9 | 1.1908 | +0.0066 | 29.14M | 51,621 |
-| g5_06 | 4L, d_model=640, n_q_head=10, n_kv_heads=10 | 1.1978 | +0.0136 | 30.08M | 50,299 |
+| g5_04     | 13L, d_model=384, n_q_head=6, n_kv_heads=6       | 1.1736     | -0.0106     | 29.17M    | 43,970     |
+| g5_05     | 5L, d_model=576, n_q_head=9, n_kv_heads=9        | 1.1908     | +0.0066     | 29.14M    | 51,621     |
+| g5_06     | 4L, d_model=640, n_q_head=10, n_kv_heads=10      | 1.1978     | +0.0136     | 30.08M    | 50,299     |
 
 ---
 
@@ -585,6 +588,7 @@ Wrote three Triton kernels (RMSNorm, RoPE, fused CE) before running any profiler
 ### 3. Vocab size was fixed too early
 
 `vocab_size` was not systematically swept until Group 10 — after nine groups of experiments all run at `vocab_size=16000`. The final optimal value turned out to be 10240 (−0.004 vs 16k). This means Groups 1–9 were optimising on a suboptimal vocabulary, and some conclusions may not fully transfer: in particular, the value embedding experiments (Group 11) showed VE benefits more with vocab=16k than 10k, suggesting the Group 11 results are partly an artefact of the vocab choice. Vocab size interacts with embedding dimensionality and weight tying; it should be treated as a foundational hyperparameter and swept in the first group rather than the tenth.
+Interestingly, I did run an [analysis](docs/analysis/tokenizer_profiler.md) on vocab size and identified the elbow point is roughly at 8K and assumed that 8K might be the sweet spot: sequence length slightly longer and saved emb params can go to the budget pools for more depth. 
 
 ### 4. Sequential ablation search misses interactions; automatic tuning was underused
 
@@ -593,5 +597,9 @@ Each group performed single-variable search on top of the previous group's best 
 ### 5. TensorBoard integration added limited value
 
 We integrated TensorBoard (loss curves, LR schedules, weight norms) early in the project. In practice, all experiment tracking and comparison was done through JSONL log files parsed by `collect_results.py`. The TensorBoard writer added code complexity, a `SummaryWriter` dependency, and extra I/O on every training step, with minimal return — the ablation tables in this report can simply be derived from mainrun logs. A leaner approach would be structured JSONL logging only, with a simple `collect_results.py` for post-hoc analysis.
+
+### 6. results can be more statistically robustness 
+
+Could take multiple run for a experiment to get a more statistically robust result. 
 
 ---
