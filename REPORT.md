@@ -517,7 +517,7 @@ Profiled on AMD MI355X using `torch.profiler` (CPU + GPU activities). 10 steps a
 | Optimizer bubbles | ~36 ms | 49 gaps >200µs, all following Muon-related kernels; root cause unconfirmed (requires CPU-stack trace) |
 
 
-Source trace file can be found in [profile_out](profile_out/7f50c7a00fc0_539736.1780024768687460356.pt.trace.json). 
+Source trace file can be found in [profile_out](profile_out/). 
 Some initial analysis can be found in [](docs/analysis/profiling.md)
 
 The launch overhead is an inherent cost of the HIP/ROCm driver and cannot be reduced without CUDA Graphs. 
